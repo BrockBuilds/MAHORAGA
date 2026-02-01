@@ -62,22 +62,31 @@ const LOG_PATH = path.join(process.cwd(), "agent-logs.json");
 
 const DEFAULT_CONFIG = {
   mcp_url: process.env.MCP_URL || "http://localhost:8787/mcp",
-  
+
   // Polling intervals
   data_poll_interval_ms: 60_000,      // Data gatherer polls every 60s
   analyst_interval_ms: 120_000,        // Trading logic runs every 2 min
-  
+
   // Trading parameters
   max_position_value: 2000,            // Max $ per position
   max_positions: 3,                    // Max concurrent positions
   min_sentiment_score: 0.4,            // Minimum bullish sentiment to buy
   min_volume: 10,                      // Minimum message volume
-  
+
   // Risk management
   take_profit_pct: 8,                  // Auto-sell at this % profit
   stop_loss_pct: 4,                    // Auto-sell at this % loss
+  trailing_stop_pct: 0,                // Trailing stop (0 = disabled, e.g., 5 = 5% trailing)
   position_size_pct_of_cash: 20,       // Max % of cash per position
-  
+  volatility_scaling: false,           // Scale positions by volatility (ATR-based)
+  atr_period: 14,                      // ATR period for volatility calculation
+  max_volatility_pct: 5,               // Max ATR % of price for position sizing
+
+  // Drawdown limits
+  daily_loss_limit_pct: 2,             // Stop trading after X% daily loss
+  weekly_loss_limit_pct: 5,            // Stop trading after X% weekly loss
+  monthly_loss_limit_pct: 10,          // Stop trading after X% monthly loss
+
   // Account config
   starting_equity: 100000,             // Starting equity for P&L calculation
 };
@@ -107,6 +116,11 @@ class ActivityLogger {
     this.maxEntries = maxEntries;
     this.entries = [];
     this.costTracker = { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 };
+    this.drawdownTracking = {
+      daily: { startEquity: null, startDate: null, peakEquity: null },
+      weekly: { startEquity: null, startDate: null, peakEquity: null },
+      monthly: { startEquity: null, startDate: null, peakEquity: null },
+    };
     this.load();
   }
 
@@ -116,6 +130,7 @@ class ActivityLogger {
         const data = JSON.parse(fs.readFileSync(LOG_PATH, "utf-8"));
         this.entries = data.entries || [];
         this.costTracker = data.costTracker || this.costTracker;
+        this.drawdownTracking = data.drawdownTracking || this.drawdownTracking;
       }
     } catch (e) {
       console.error("Failed to load logs:", e.message);
@@ -123,7 +138,11 @@ class ActivityLogger {
   }
 
   save() {
-    const data = { entries: this.entries.slice(-this.maxEntries), costTracker: this.costTracker };
+    const data = {
+      entries: this.entries.slice(-this.maxEntries),
+      costTracker: this.costTracker,
+      drawdownTracking: this.drawdownTracking,
+    };
     fs.writeFileSync(LOG_PATH, JSON.stringify(data, null, 2));
   }
 
@@ -136,7 +155,7 @@ class ActivityLogger {
     };
     this.entries.push(entry);
     console.log(`[${entry.timestamp}] [${agent}] ${action}`, details.symbol ? `(${details.symbol})` : "");
-    
+
     if (this.entries.length % 10 === 0) {
       this.save();
     }
@@ -149,6 +168,48 @@ class ActivityLogger {
 
   getCosts() {
     return this.costTracker;
+  }
+
+  // Drawdown tracking
+  initDrawdownTracking(equity) {
+    const now = new Date();
+    const today = now.toISOString().split("T")[0];
+    const weekStart = this.getWeekStart(now);
+    const monthStart = this.getMonthStart(now);
+
+    // Initialize if new period
+    if (this.drawdownTracking.daily.startDate !== today) {
+      this.drawdownTracking.daily = { startEquity: equity, startDate: today, peakEquity: equity };
+    }
+    if (this.drawdownTracking.weekly.startDate !== weekStart) {
+      this.drawdownTracking.weekly = { startEquity: equity, startDate: weekStart, peakEquity: equity };
+    }
+    if (this.drawdownTracking.monthly.startDate !== monthStart) {
+      this.drawdownTracking.monthly = { startEquity: equity, startDate: monthStart, peakEquity: equity };
+    }
+
+    // Update peak equity
+    this.drawdownTracking.daily.peakEquity = Math.max(this.drawdownTracking.daily.peakEquity, equity);
+    this.drawdownTracking.weekly.peakEquity = Math.max(this.drawdownTracking.weekly.peakEquity, equity);
+    this.drawdownTracking.monthly.peakEquity = Math.max(this.drawdownTracking.monthly.peakEquity, equity);
+  }
+
+  getDrawdownPct(period, currentEquity) {
+    const tracking = this.drawdownTracking[period];
+    if (!tracking || !tracking.peakEquity || tracking.peakEquity === 0) return 0;
+    return ((tracking.peakEquity - currentEquity) / tracking.peakEquity) * 100;
+  }
+
+  getWeekStart(date) {
+    const d = new Date(date);
+    const day = d.getDay();
+    const diff = d.getDate() - day + (day === 0 ? -6 : 1);
+    d.setDate(diff);
+    return d.toISOString().split("T")[0];
+  }
+
+  getMonthStart(date) {
+    return date.toISOString().slice(0, 7) + "-01";
   }
 }
 
@@ -350,7 +411,10 @@ class SimpleOrchestrator {
     this.logger = new ActivityLogger();
     this.signalCache = [];
     this.lastAnalystRun = 0;
-    
+
+    // Position tracking for trailing stops and volatility
+    this.positionTracking = new Map(); // symbol -> { entryPrice, peakPrice, avgPrice, lastQuote }
+
     this.stocktwits = new StockTwitsAgent(this.logger);
     this.executor = null;
     this.mcp = null;
@@ -389,10 +453,19 @@ class SimpleOrchestrator {
 
   async runDataGatherers() {
     this.logger.log("System", "gathering_data");
-    
+
     const stocktwitsSignals = await this.stocktwits.gatherSignals();
     this.signalCache = stocktwitsSignals;
-    
+
+    // Cleanup stale position tracking (positions no longer held)
+    const { positions } = await this.getAccountState();
+    const heldSymbols = new Set(positions.map(p => p.symbol));
+    for (const symbol of this.positionTracking.keys()) {
+      if (!heldSymbols.has(symbol)) {
+        this.positionTracking.delete(symbol);
+      }
+    }
+
     this.logger.log("System", "data_gathered", {
       stocktwits: stocktwitsSignals.length,
       total: stocktwitsSignals.length,
@@ -420,15 +493,47 @@ class SimpleOrchestrator {
 
   async runTradingLogic() {
     const { account, positions, clock } = await this.getAccountState();
-    
+
     if (!account) {
       this.logger.log("System", "skipped_trading", { reason: "No account data" });
-      return;
+      return { allowed: false, reason: "No account data" };
     }
 
     if (!clock?.is_open) {
       this.logger.log("System", "market_closed");
-      return;
+      return { allowed: false, reason: "Market closed" };
+    }
+
+    // Initialize drawdown tracking if needed
+    this.logger.initDrawdownTracking(account.equity);
+
+    // Check drawdown limits
+    const dailyDrawdown = this.logger.getDrawdownPct("daily", account.equity);
+    const weeklyDrawdown = this.logger.getDrawdownPct("weekly", account.equity);
+    const monthlyDrawdown = this.logger.getDrawdownPct("monthly", account.equity);
+
+    if (dailyDrawdown >= this.config.daily_loss_limit_pct) {
+      this.logger.log("System", "trading_paused_daily_drawdown", {
+        drawdown: dailyDrawdown.toFixed(2),
+        limit: this.config.daily_loss_limit_pct,
+      });
+      return { allowed: false, reason: `Daily drawlimit hit: ${dailyDrawdown.toFixed(2)}%` };
+    }
+
+    if (weeklyDrawdown >= this.config.weekly_loss_limit_pct) {
+      this.logger.log("System", "trading_paused_weekly_drawdown", {
+        drawdown: weeklyDrawdown.toFixed(2),
+        limit: this.config.weekly_loss_limit_pct,
+      });
+      return { allowed: false, reason: `Weekly drawlimit hit: ${weeklyDrawdown.toFixed(2)}%` };
+    }
+
+    if (monthlyDrawdown >= this.config.monthly_loss_limit_pct) {
+      this.logger.log("System", "trading_paused_monthly_drawdown", {
+        drawdown: monthlyDrawdown.toFixed(2),
+        limit: this.config.monthly_loss_limit_pct,
+      });
+      return { allowed: false, reason: `Monthly drawlimit hit: ${monthlyDrawdown.toFixed(2)}%` };
     }
 
     const heldSymbols = new Set(positions.map(p => p.symbol));
@@ -437,19 +542,53 @@ class SimpleOrchestrator {
     // STEP 1: Check existing positions for exit signals
     // ========================================================================
     for (const pos of positions) {
+      // Update position tracking
+      let tracking = this.positionTracking.get(pos.symbol);
+      if (!tracking) {
+        tracking = {
+          entryPrice: pos.avg_entry_price,
+          peakPrice: pos.avg_entry_price,
+          entryTime: Date.now(),
+        };
+        this.positionTracking.set(pos.symbol, tracking);
+      }
+
+      // Get current quote for trailing stop
+      const quoteResult = await this.executor.callTool("market-quote", { symbol: pos.symbol });
+      const currentPrice = quoteResult.ok ? quoteResult.data.price : pos.current_price;
+      tracking.peakPrice = Math.max(tracking.peakPrice, currentPrice);
+
       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
-      
+
+      // Trailing stop check
+      if (this.config.trailing_stop_pct > 0 && currentPrice > tracking.entryPrice) {
+        const trailingDistancePct = ((tracking.peakPrice - currentPrice) / tracking.peakPrice) * 100;
+        if (trailingDistancePct >= this.config.trailing_stop_pct) {
+          this.logger.log("System", "trailing_stop_triggered", {
+            symbol: pos.symbol,
+            peakPrice: tracking.peakPrice.toFixed(2),
+            currentPrice: currentPrice.toFixed(2),
+            trailingDrop: trailingDistancePct.toFixed(2),
+          });
+          await this.executor.executeSell(pos.symbol, `Trailing stop at -${this.config.trailing_stop_pct}% from peak`);
+          this.positionTracking.delete(pos.symbol);
+          continue;
+        }
+      }
+
       // Take profit
       if (plPct >= this.config.take_profit_pct) {
         this.logger.log("System", "take_profit_triggered", { symbol: pos.symbol, pnl: plPct.toFixed(2) });
         await this.executor.executeSell(pos.symbol, `Take profit at +${plPct.toFixed(1)}%`);
+        this.positionTracking.delete(pos.symbol);
         continue;
       }
-      
+
       // Stop loss
       if (plPct <= -this.config.stop_loss_pct) {
         this.logger.log("System", "stop_loss_triggered", { symbol: pos.symbol, pnl: plPct.toFixed(2) });
         await this.executor.executeSell(pos.symbol, `Stop loss at ${plPct.toFixed(1)}%`);
+        this.positionTracking.delete(pos.symbol);
         continue;
       }
     }
@@ -459,7 +598,7 @@ class SimpleOrchestrator {
     // ========================================================================
     if (positions.length >= this.config.max_positions) {
       this.logger.log("System", "max_positions_reached", { count: positions.length });
-      return;
+      return { allowed: true, paused: "max_positions" };
     }
 
     // Filter signals to find buy candidates
@@ -474,18 +613,46 @@ class SimpleOrchestrator {
     // Try to buy top candidates
     for (const signal of buyCandidates.slice(0, 3)) {
       if (positions.length >= this.config.max_positions) break;
-      
+
       // Use sentiment as confidence (0-1 scale)
-      const confidence = Math.min(1, Math.max(0.5, signal.sentiment + 0.3));
-      
-      this.logger.log("System", "considering_buy", { 
-        symbol: signal.symbol, 
+      let confidence = Math.min(1, Math.max(0.5, signal.sentiment + 0.3));
+
+      // Get volatility data for position sizing
+      let volatilityMultiplier = 1;
+      if (this.config.volatility_scaling) {
+        try {
+          const techResult = await this.executor.callTool("technicals-get", {
+            symbol: signal.symbol,
+            period: this.config.atr_period,
+          });
+
+          if (techResult.ok && techResult.data.atr_pct) {
+            const atrPct = techResult.data.atr_pct;
+            // Reduce position size for high-volatility stocks
+            if (atrPct > this.config.max_volatility_pct) {
+              volatilityMultiplier = this.config.max_volatility_pct / atrPct;
+              confidence *= volatilityMultiplier;
+              this.logger.log("System", "volatility_adjustment", {
+                symbol: signal.symbol,
+                atrPct: atrPct.toFixed(2),
+                multiplier: volatilityMultiplier.toFixed(2),
+              });
+            }
+          }
+        } catch (err) {
+          this.logger.log("System", "volatility_fetch_failed", { symbol: signal.symbol, error: err.message });
+        }
+      }
+
+      this.logger.log("System", "considering_buy", {
+        symbol: signal.symbol,
         sentiment: signal.sentiment.toFixed(2),
         volume: signal.volume,
+        confidence: confidence.toFixed(2),
       });
-      
+
       const result = await this.executor.executeBuy(signal.symbol, confidence, signal.reason);
-      
+
       if (result) {
         heldSymbols.add(signal.symbol);
         // Don't spam - one buy per cycle
@@ -494,6 +661,7 @@ class SimpleOrchestrator {
     }
 
     this.lastAnalystRun = Date.now();
+    return { allowed: true };
   }
 
   // ==========================================================================
@@ -570,18 +738,38 @@ class SimpleOrchestrator {
     }, 60_000);
   }
 
-  getStatus() {
+  async getStatus() {
+    const { account, positions, clock } = await this.getAccountState();
+
+    // Calculate current drawdowns
+    let dailyDrawdown = 0, weeklyDrawdown = 0, monthlyDrawdown = 0;
+    if (account?.equity) {
+      dailyDrawdown = this.logger.getDrawdownPct("daily", account.equity);
+      weeklyDrawdown = this.logger.getDrawdownPct("weekly", account.equity);
+      monthlyDrawdown = this.logger.getDrawdownPct("monthly", account.equity);
+    }
+
     return {
       config: this.config,
       signals: this.signalCache,
       logs: this.logger.getRecentLogs(100),
       costs: this.logger.getCosts(),
       lastAnalystRun: this.lastAnalystRun,
+      drawdown: {
+        daily: dailyDrawdown,
+        weekly: weeklyDrawdown,
+        monthly: monthlyDrawdown,
+        limits: {
+          daily: this.config.daily_loss_limit_pct,
+          weekly: this.config.weekly_loss_limit_pct,
+          monthly: this.config.monthly_loss_limit_pct,
+        },
+      },
       // v1 doesn't have advanced features
       signalResearch: {},
       positionResearch: {},
       stalenessAnalysis: {},
-      positionTracking: {},
+      positionTracking: Object.fromEntries(this.positionTracking),
       optionsEnabled: false,
     };
   }
@@ -614,8 +802,8 @@ function startDashboardAPI(orchestrator) {
     try {
       if (url.pathname === "/api/status") {
         const { account, positions, clock } = await orchestrator.getAccountState();
-        const status = orchestrator.getStatus();
-        
+        const status = await orchestrator.getStatus();
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           ok: true,
