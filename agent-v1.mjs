@@ -352,6 +352,8 @@ TECHNICAL INDICATORS:
 
     const prompt = `Analyze this trading signal and provide a recommendation.
 
+IMPORTANT: You must identify counterarguments before making a decision. Trading against the crowd can be profitable, but you need to understand what the bears are thinking.
+
 SENTIMENT DATA:
 - Symbol: ${signal.symbol}
 - Source: ${signal.source}
@@ -362,19 +364,26 @@ SENTIMENT DATA:
 - Sentiment reason: ${signal.reason}
 ${technicalContext}
 
+YOUR TASK:
+1. First, identify 2-3 BEARISH arguments for this symbol (even if sentiment is bullish)
+2. Identify 2-3 BULLISH arguments for this symbol (even if sentiment is bearish)
+3. Weigh the evidence and make a final decision
+
 Respond with a JSON object (no markdown, just the JSON):
 {
+  "bullish_arguments": ["arg1", "arg2", "arg3"],
+  "bearish_arguments": ["arg1", "arg2", "arg3"],
   "decision": "BUY" | "SKIP" | "WAIT",
   "confidence": 0.0 to 1.0,
-  "reasoning": "brief explanation (2-3 sentences max)",
+  "reasoning": "2-3 sentence summary weighing both sides",
   "risks": "key risks to consider"
 }
 
-Consider:
-- Is sentiment justified by price action?
-- Are technicals aligned with bullish sentiment?
-- Is it too late to enter (momentum exhausted)?
-- Any red flags in the sentiment?`;
+Guidelines:
+- If sentiment is strongly bullish (>70%), the bearish arguments should be especially compelling to override
+- If sentiment is mixed or slightly bullish, look for confirmation from technicals
+- SKIP if you cannot find enough information to make a confident decision
+- WAIT if the timing seems wrong but the thesis is sound`;
 
     try {
       const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -419,6 +428,9 @@ Consider:
         symbol: signal.symbol,
         decision: result.decision,
         confidence: result.confidence,
+        bullish_args_count: result.bullish_arguments?.length || 0,
+        bearish_args_count: result.bearish_arguments?.length || 0,
+        reasoning: result.reasoning,
       });
 
       return result;
