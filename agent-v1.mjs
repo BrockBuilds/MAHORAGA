@@ -306,6 +306,152 @@ class StockTwitsAgent {
 }
 
 // ============================================================================
+// LLM Analysis
+// ============================================================================
+
+class LLMAnalyzer {
+  constructor(logger, apiKey = null) {
+    this.logger = logger;
+    this.apiKey = apiKey || process.env.OPENAI_API_KEY;
+    this.name = "LLMAnalyzer";
+    this.model = "gpt-4o-mini";
+    this.cache = new Map(); // symbol -> { result, timestamp }
+    this.cacheDuration = 300_000; // 5 minutes
+  }
+
+  isConfigured() {
+    return !!this.apiKey;
+  }
+
+  async analyzeSignal(signal, technicals = null) {
+    const cacheKey = signal.symbol;
+    const cached = this.cache.get(cacheKey);
+
+    if (cached && Date.now() - cached.timestamp < this.cacheDuration) {
+      this.logger.log(this.name, "cache_hit", { symbol: signal.symbol });
+      return cached.result;
+    }
+
+    if (!this.isConfigured()) {
+      this.logger.log(this.name, "not_configured", { symbol: signal.symbol });
+      return null;
+    }
+
+    // Build technical context
+    let technicalContext = "";
+    if (technicals) {
+      technicalContext = `
+TECHNICAL INDICATORS:
+- RSI: ${technicals.rsi?.toFixed(2) || "N/A"} (${this.interpretRsi(technicals.rsi)})
+- MACD: ${technicals.macd?.toFixed(2) || "N/A"} (${this.interpretMacd(technicals.macd, technicals.macd_signal)})
+- ATR %: ${technicals.atr_pct?.toFixed(2) || "N/A"}% (volatility)
+- Price vs 50 SMA: ${this.priceVsSma(technicals.price, technicals.sma_50)}%
+- Volume: ${technicals.volume?.toFixed(0) || "N/A"}
+`;
+    }
+
+    const prompt = `Analyze this trading signal and provide a recommendation.
+
+SENTIMENT DATA:
+- Symbol: ${signal.symbol}
+- Source: ${signal.source}
+- Bullish messages: ${signal.bullish}
+- Bearish messages: ${signal.bearish}
+- Sentiment score: ${(signal.sentiment * 100).toFixed(0)}% (range: -100% to +100%)
+- Message volume: ${signal.volume}
+- Sentiment reason: ${signal.reason}
+${technicalContext}
+
+Respond with a JSON object (no markdown, just the JSON):
+{
+  "decision": "BUY" | "SKIP" | "WAIT",
+  "confidence": 0.0 to 1.0,
+  "reasoning": "brief explanation (2-3 sentences max)",
+  "risks": "key risks to consider"
+}
+
+Consider:
+- Is sentiment justified by price action?
+- Are technicals aligned with bullish sentiment?
+- Is it too late to enter (momentum exhausted)?
+- Any red flags in the sentiment?`;
+
+    try {
+      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: this.model,
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.3,
+          max_tokens: 200,
+        }),
+      });
+
+      if (!response.ok) {
+        this.logger.log(this.name, "api_error", { symbol: signal.symbol, status: response.status });
+        return null;
+      }
+
+      const data = await response.json();
+      const content = data.choices?.[0]?.message?.content;
+
+      if (!content) {
+        return null;
+      }
+
+      // Parse JSON from response
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        this.logger.log(this.name, "parse_error", { symbol: signal.symbol, content });
+        return null;
+      }
+
+      const result = JSON.parse(jsonMatch[0]);
+
+      // Cache the result
+      this.cache.set(cacheKey, { result, timestamp: Date.now() });
+
+      this.logger.log(this.name, "analyzed", {
+        symbol: signal.symbol,
+        decision: result.decision,
+        confidence: result.confidence,
+      });
+
+      return result;
+    } catch (err) {
+      this.logger.log(this.name, "error", { symbol: signal.symbol, error: err.message });
+      return null;
+    }
+  }
+
+  interpretRsi(rsi) {
+    if (!rsi) return "N/A";
+    if (rsi > 70) return "overbought";
+    if (rsi < 30) return "oversold";
+    if (rsi > 50) return "bullish";
+    if (rsi < 50) return "bearish";
+    return "neutral";
+  }
+
+  interpretMacd(macd, signal) {
+    if (!macd || !signal) return "N/A";
+    const diff = macd - signal;
+    if (diff > 0) return "bullish crossover";
+    if (diff < 0) return "bearish";
+    return "neutral";
+  }
+
+  priceVsSma(price, sma) {
+    if (!price || !sma) return 0;
+    return ((price - sma) / sma) * 100;
+  }
+}
+
+// ============================================================================
 // Trading Executor
 // ============================================================================
 
@@ -416,6 +562,7 @@ class SimpleOrchestrator {
     this.positionTracking = new Map(); // symbol -> { entryPrice, peakPrice, avgPrice, lastQuote }
 
     this.stocktwits = new StockTwitsAgent(this.logger);
+    this.llmAnalyzer = new LLMAnalyzer(this.logger);
     this.executor = null;
     this.mcp = null;
   }
@@ -614,33 +761,65 @@ class SimpleOrchestrator {
     for (const signal of buyCandidates.slice(0, 3)) {
       if (positions.length >= this.config.max_positions) break;
 
-      // Use sentiment as confidence (0-1 scale)
+      // Get technical indicators for LLM analysis
+      let technicals = null;
+      try {
+        const techResult = await this.executor.callTool("technicals-get", {
+          symbol: signal.symbol,
+          timeframe: "1Day",
+        });
+        if (techResult.ok) {
+          technicals = techResult.data;
+        }
+      } catch (err) {
+        this.logger.log("System", "technicals_fetch_failed", { symbol: signal.symbol, error: err.message });
+      }
+
+      // Use LLM analysis if available, otherwise fall back to sentiment
+      let llmDecision = null;
       let confidence = Math.min(1, Math.max(0.5, signal.sentiment + 0.3));
+      let useLlm = false;
 
-      // Get volatility data for position sizing
-      let volatilityMultiplier = 1;
-      if (this.config.volatility_scaling) {
-        try {
-          const techResult = await this.executor.callTool("technicals-get", {
-            symbol: signal.symbol,
-            period: this.config.atr_period,
-          });
+      if (this.llmAnalyzer.isConfigured()) {
+        llmDecision = await this.llmAnalyzer.analyzeSignal(signal, technicals);
 
-          if (techResult.ok && techResult.data.atr_pct) {
-            const atrPct = techResult.data.atr_pct;
-            // Reduce position size for high-volatility stocks
-            if (atrPct > this.config.max_volatility_pct) {
-              volatilityMultiplier = this.config.max_volatility_pct / atrPct;
-              confidence *= volatilityMultiplier;
-              this.logger.log("System", "volatility_adjustment", {
-                symbol: signal.symbol,
-                atrPct: atrPct.toFixed(2),
-                multiplier: volatilityMultiplier.toFixed(2),
-              });
-            }
+        if (llmDecision) {
+          useLlm = true;
+          // Use LLM decision and confidence
+          if (llmDecision.decision === "SKIP") {
+            this.logger.log("System", "llm_skipped", {
+              symbol: signal.symbol,
+              reasoning: llmDecision.reasoning,
+            });
+            continue; // Skip this candidate
           }
-        } catch (err) {
-          this.logger.log("System", "volatility_fetch_failed", { symbol: signal.symbol, error: err.message });
+
+          // Use LLM confidence if available, otherwise use sentiment-based
+          if (llmDecision.confidence !== undefined) {
+            confidence = llmDecision.confidence;
+          }
+
+          this.logger.log("System", "llm_analyzed", {
+            symbol: signal.symbol,
+            decision: llmDecision.decision,
+            confidence: confidence.toFixed(2),
+            reasoning: llmDecision.reasoning,
+          });
+        }
+      }
+
+      // Apply volatility-based position sizing
+      let volatilityMultiplier = 1;
+      if (this.config.volatility_scaling && technicals?.atr_pct) {
+        const atrPct = technicals.atr_pct;
+        if (atrPct > this.config.max_volatility_pct) {
+          volatilityMultiplier = this.config.max_volatility_pct / atrPct;
+          confidence *= volatilityMultiplier;
+          this.logger.log("System", "volatility_adjustment", {
+            symbol: signal.symbol,
+            atrPct: atrPct.toFixed(2),
+            multiplier: volatilityMultiplier.toFixed(2),
+          });
         }
       }
 
@@ -649,6 +828,8 @@ class SimpleOrchestrator {
         sentiment: signal.sentiment.toFixed(2),
         volume: signal.volume,
         confidence: confidence.toFixed(2),
+        useLlm,
+        llmDecision: llmDecision?.decision || null,
       });
 
       const result = await this.executor.executeBuy(signal.symbol, confidence, signal.reason);
