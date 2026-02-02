@@ -776,7 +776,7 @@ Respond JSON only:
         model: "minimax/MiniMax-M2.1",
         messages: [{ role: "user", content: prompt }],
         temperature: 0.3,
-        max_tokens: 150,
+        max_tokens: 300,
       }),
     });
 
@@ -788,10 +788,12 @@ Respond JSON only:
 
     const data = await response.json();
 
-    // Extract content from thinking blocks
+    // Extract content from thinking/text blocks
     let content = "";
     if (data.content && Array.isArray(data.content)) {
-      content = data.content[0]?.thinking || "";
+      // Prefer text blocks over thinking blocks
+      const textBlock = data.content.find(block => block.type === "text");
+      content = textBlock?.text || data.content[0]?.thinking || "";
     }
 
     // Parse JSON from content
@@ -824,7 +826,7 @@ Respond JSON only:
         model: "anthropic/claude-3-haiku", // Default, can be overridden
         messages: [{ role: "user", content: prompt }],
         temperature: 0.3,
-        max_tokens: 150,
+        max_tokens: 300,
       }),
     });
 
