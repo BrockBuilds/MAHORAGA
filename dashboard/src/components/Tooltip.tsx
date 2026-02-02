@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, type ReactNode, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'motion/react'
+import clsx from 'clsx'
 
 type TooltipPosition = 'top' | 'bottom' | 'left' | 'right'
 
@@ -203,11 +204,11 @@ export function TooltipContent({ title, items, description }: TooltipContentProp
       )}
       
       {items && items.length > 0 && (
-        <div className="space-y-1">
+        <div className="space-y-1 min-w-0">
           {items.map((item, i) => (
-            <div key={i} className="flex justify-between gap-4">
-              <span className="text-hud-text-dim">{item.label}</span>
-              <span className={item.color || 'text-hud-text-bright'}>{item.value}</span>
+            <div key={i} className="flex justify-between gap-2 min-w-0">
+              <span className="text-hud-text-dim truncate">{item.label}</span>
+              <span className={clsx(item.color || 'text-hud-text-bright', 'truncate')}>{item.value}</span>
             </div>
           ))}
         </div>
