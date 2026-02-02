@@ -145,7 +145,7 @@ export function TooltipPortal({ isVisible, coords, position, content, className 
           className={`
             bg-hud-bg-panel border border-hud-line
             px-3 py-2 text-xs text-hud-text
-            max-w-xs pointer-events-none
+            max-w-[280px] pointer-events-none shadow-xl
             ${className}
           `}
         >
@@ -206,9 +206,9 @@ export function TooltipContent({ title, items, description }: TooltipContentProp
       {items && items.length > 0 && (
         <div className="space-y-1 min-w-0">
           {items.map((item, i) => (
-            <div key={i} className="flex justify-between gap-2 min-w-0">
-              <span className="text-hud-text-dim truncate">{item.label}</span>
-              <span className={clsx(item.color || 'text-hud-text-bright', 'truncate')}>{item.value}</span>
+            <div key={i} className="flex justify-between items-center gap-2 min-w-0 whitespace-nowrap">
+              <span className="text-hud-text-dim truncate shrink-0">{item.label}</span>
+              <span className={clsx(item.color || 'text-hud-text-bright', 'truncate shrink-0 ml-auto')}>{item.value}</span>
             </div>
           ))}
         </div>
