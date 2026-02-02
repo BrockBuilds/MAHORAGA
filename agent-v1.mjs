@@ -1076,6 +1076,122 @@ class Backtester {
 }
 
 // ============================================================================
+// Paper Trading Reporter
+// ============================================================================
+
+class PaperTraderReporter {
+  constructor(logger) {
+    this.logger = logger;
+    this.name = "PaperTraderReporter";
+    this.tradeHistory = [];
+    this.sessionStartEquity = null;
+    this.sessionStartTime = null;
+  }
+
+  startSession(equity) {
+    this.sessionStartEquity = equity;
+    this.sessionStartTime = Date.now();
+    this.tradeHistory = [];
+    this.logger.log(this.name, "session_started", { equity });
+  }
+
+  recordTrade(trade) {
+    this.tradeHistory.push({
+      ...trade,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  generateReport() {
+    if (!this.sessionStartEquity || this.tradeHistory.length === 0) {
+      return {
+        ok: false,
+        error: "No session data available",
+      };
+    }
+
+    const closedTrades = this.tradeHistory.filter(t => t.status === "closed");
+    const openPositions = this.tradeHistory.filter(t => t.status === "open");
+    const winningTrades = closedTrades.filter(t => t.pnl > 0);
+    const losingTrades = closedTrades.filter(t => t.pnl <= 0);
+
+    const totalPnl = closedTrades.reduce((sum, t) => sum + t.pnl, 0);
+    const avgWin = winningTrades.length > 0
+      ? winningTrades.reduce((sum, t) => sum + t.pnl, 0) / winningTrades.length
+      : 0;
+    const avgLoss = losingTrades.length > 0
+      ? losingTrades.reduce((sum, t) => sum + t.pnl, 0) / losingTrades.length
+      : 0;
+
+    const report = {
+      session: {
+        start_time: new Date(this.sessionStartTime).toISOString(),
+        duration_hours: (Date.now() - this.sessionStartTime) / 3600000,
+        starting_equity: this.sessionStartEquity,
+      },
+      summary: {
+        total_trades: closedTrades.length,
+        open_positions: openPositions.length,
+        winning_trades: winningTrades.length,
+        losing_trades: losingTrades.length,
+        win_rate: closedTrades.length > 0 ? winningTrades.length / closedTrades.length : 0,
+      },
+      pnl: {
+        total_pnl: totalPnl,
+        avg_win: avgWin,
+        avg_loss: avgLoss,
+        profit_factor: avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : avgWin > 0 ? Infinity : 0,
+      },
+      setup_performance: {},
+      recent_trades: closedTrades.slice(-20),
+    };
+
+    // Calculate performance by setup type
+    const setupStats = {};
+    for (const trade of closedTrades) {
+      const setup = trade.setup || "unknown";
+      if (!setupStats[setup]) {
+        setupStats[setup] = { trades: 0, wins: 0, pnl: 0 };
+      }
+      setupStats[setup].trades++;
+      setupStats[setup].wins += trade.pnl > 0 ? 1 : 0;
+      setupStats[setup].pnl += trade.pnl;
+    }
+
+    report.setup_performance = Object.entries(setupStats).map(([name, stats]) => ({
+      setup: name,
+      trades: stats.trades,
+      win_rate: stats.trades > 0 ? stats.wins / stats.trades : 0,
+      pnl: stats.pnl,
+    }));
+
+    report.setup_performance.sort((a, b) => b.pnl - a.pnl);
+
+    this.logger.log(this.name, "report_generated", {
+      total_trades: report.summary.total_trades,
+      win_rate: (report.summary.win_rate * 100).toFixed(1),
+      total_pnl: totalPnl.toFixed(2),
+    });
+
+    return { ok: true, data: report };
+  }
+
+  getPerformanceMetrics() {
+    const report = this.generateReport();
+    if (!report.ok) return null;
+
+    return {
+      win_rate: report.data.summary.win_rate,
+      profit_factor: report.data.pnl.profit_factor,
+      total_pnl: report.data.pnl.total_pnl,
+      avg_trade_pnl: report.data.summary.total_trades > 0
+        ? report.data.pnl.total_pnl / report.data.summary.total_trades
+        : 0,
+    };
+  }
+}
+
+// ============================================================================
 // Main Orchestrator
 // ============================================================================
 
@@ -1095,6 +1211,7 @@ class SimpleOrchestrator {
     this.optionsFlow = new OptionsFlowAgent(this.logger);
     this.fundamentals = new FundamentalsAgent(this.logger);
     this.backtester = new Backtester(this.logger);
+    this.paperReporter = new PaperTraderReporter(this.logger);
     this.llmAnalyzer = new LLMAnalyzer(this.logger);
     this.executor = null;
     this.mcp = null;
@@ -1717,6 +1834,14 @@ function startDashboardAPI(orchestrator) {
             res.end(JSON.stringify({ ok: false, error: e.message }));
           }
         });
+      } else if (url.pathname === "/api/paper/report") {
+        const report = orchestrator.paperReporter.generateReport();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(report));
+      } else if (url.pathname === "/api/paper/performance") {
+        const metrics = orchestrator.paperReporter.getPerformanceMetrics();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, data: metrics }));
       } else {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "Not found" }));
@@ -1729,12 +1854,14 @@ function startDashboardAPI(orchestrator) {
 
   server.listen(PORT, () => {
     console.log(`Dashboard API: http://localhost:${PORT}`);
-    console.log(`  GET  /api/status         - Full status`);
-    console.log(`  GET  /api/config         - Get config`);
-    console.log(`  POST /api/config         - Update config`);
-    console.log(`  GET  /api/logs           - Activity logs`);
-    console.log(`  POST /api/backtest       - Run backtest`);
-    console.log(`  POST /api/backtest/compare - Compare strategies\n`);
+    console.log(`  GET  /api/status           - Full status`);
+    console.log(`  GET  /api/config           - Get config`);
+    console.log(`  POST /api/config           - Update config`);
+    console.log(`  GET  /api/logs             - Activity logs`);
+    console.log(`  POST /api/backtest         - Run backtest`);
+    console.log(`  POST /api/backtest/compare - Compare strategies`);
+    console.log(`  GET  /api/paper/report     - Paper trading report`);
+    console.log(`  GET  /api/paper/performance - Performance metrics\n`);
   });
 }
 
