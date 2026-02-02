@@ -1571,12 +1571,12 @@ class SimpleOrchestrator {
           this.executor.getPositions(),
         ]);
 
-        // Determine if market is open (simplified - assume open Mon-Fri 9:30-16:00 ET)
+        // Determine if market is open (Mon-Fri 9:30-16:00 ET)
         const now = new Date();
-        const day = now.getDay();
-        const hour = now.getHours();
-        const isWeekday = day >= 1 && day <= 5;
-        const isMarketHours = hour >= 14 && hour < 21; // UTC equivalent of 9AM-4PM ET
+        const utcHour = now.getUTCHours();
+        const utcDay = now.getUTCDay();
+        const isWeekday = utcDay >= 1 && utcDay <= 5;
+        const isMarketHours = utcHour >= 14 && utcHour < 21; // 14:00-21:00 UTC = 9:30 AM-4:00 PM ET
 
         return {
           account: account.ok ? account.data : null,
