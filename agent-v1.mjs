@@ -692,9 +692,10 @@ class FundamentalsAgent {
 class LLMAnalyzer {
   constructor(logger, apiKey = null) {
     this.logger = logger;
-    this.apiKey = apiKey || process.env.OPENAI_API_KEY;
+    this.apiKey = apiKey || process.env.MINIMAX_API_KEY;
     this.name = "LLMAnalyzer";
-    this.model = "gpt-4o-mini";
+    this.model = "minimax/MiniMax-M2.1";
+    this.apiUrl = "https://api.minimax.io/anthropic/v1/messages";
     this.cache = new Map(); // symbol -> { result, timestamp }
     this.cacheDuration = 300_000; // 5 minutes
   }
@@ -782,11 +783,12 @@ Guidelines:
 - WAIT if the timing seems wrong but the thesis is sound`;
 
     try {
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      const response = await fetch(this.apiUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${this.apiKey}`,
+          "anthropic-version": "2023-06-01",
         },
         body: JSON.stringify({
           model: this.model,
@@ -797,12 +799,13 @@ Guidelines:
       });
 
       if (!response.ok) {
-        this.logger.log(this.name, "api_error", { symbol: signal.symbol, status: response.status });
+        const errorText = await response.text();
+        this.logger.log(this.name, "api_error", { symbol: signal.symbol, status: response.status, error: errorText });
         return null;
       }
 
       const data = await response.json();
-      const content = data.choices?.[0]?.message?.content;
+      const content = data.content?.[0]?.text;
 
       if (!content) {
         return null;
@@ -2100,7 +2103,7 @@ function startDashboardAPI(orchestrator) {
         res.end(JSON.stringify({ ok: true, data: orchestrator.logger.getCosts() }));
       } else if (url.pathname === "/api/setup/status") {
         const hasAlpaca = !!(process.env.ALPACA_API_KEY && process.env.ALPACA_API_SECRET);
-        const hasOpenAI = !!process.env.OPENAI_API_KEY;
+        const hasMiniMax = !!process.env.MINIMAX_API_KEY;
         const startingEquity = orchestrator.config.starting_equity || 100000;
         
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -2109,7 +2112,7 @@ function startDashboardAPI(orchestrator) {
           data: { 
             configured: hasAlpaca,
             has_alpaca: hasAlpaca,
-            has_openai: hasOpenAI,
+            has_llm: hasMiniMax,
             starting_equity: startingEquity,
             paper_mode: process.env.ALPACA_PAPER === "true"
           } 
@@ -2119,14 +2122,14 @@ function startDashboardAPI(orchestrator) {
         req.on("data", (chunk) => body += chunk);
         req.on("end", () => {
           try {
-            const { alpaca_key, alpaca_secret, openai_key, paper_mode, starting_equity } = JSON.parse(body);
+            const { alpaca_key, alpaca_secret, minimax_key, paper_mode, starting_equity } = JSON.parse(body);
             
             // Build .dev.vars content
             let envContent = "";
             if (alpaca_key) envContent += `ALPACA_API_KEY=${alpaca_key}\n`;
             if (alpaca_secret) envContent += `ALPACA_API_SECRET=${alpaca_secret}\n`;
             envContent += `ALPACA_PAPER=${paper_mode !== false ? "true" : "false"}\n`;
-            if (openai_key) envContent += `OPENAI_API_KEY=${openai_key}\n`;
+            if (minimax_key) envContent += `MINIMAX_API_KEY=${minimax_key}\n`;
             envContent += `KILL_SWITCH_SECRET=mahoraga_kill_${Date.now()}\n`;
             
             // Write to .dev.vars
