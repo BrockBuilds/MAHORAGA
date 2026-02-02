@@ -426,6 +426,104 @@ class RedditAgent {
 }
 
 // ============================================================================
+// Twitter Agent (Multi-Source Sentiment)
+// ============================================================================
+
+class TwitterAgent {
+  constructor(logger) {
+    this.logger = logger;
+    this.name = "Twitter";
+    // Note: Twitter API requires authentication for most endpoints
+    // This uses a basic placeholder - replace with actual API calls if keys available
+    this.apiKey = process.env.TWITTER_API_KEY;
+    this.apiSecret = process.env.TWITTER_API_SECRET;
+  }
+
+  isConfigured() {
+    return !!(this.apiKey && this.apiSecret);
+  }
+
+  async searchTweets(query, count = 50) {
+    if (!this.isConfigured()) {
+      this.logger.log(this.name, "not_configured");
+      return [];
+    }
+
+    try {
+      // Placeholder for Twitter API v2 call
+      // In production: POST https://api.twitter.com/2/tweets/search/recent
+      const response = await fetch(`https://api.twitter.com/2/tweets/search/recent?query=${encodeURIComponent(query)}&max_results=${count}`, {
+        headers: {
+          "Authorization": `Bearer ${this.apiKey}`,
+        },
+      });
+
+      if (!response.ok) return [];
+      const data = await response.json();
+      return data.data || [];
+    } catch (err) {
+      this.logger.log(this.name, "error", { message: err.message });
+      return [];
+    }
+  }
+
+  analyzeSentiment(tweets) {
+    const bullishTerms = ["bullish", "long", "buy", "call", "moon", "up", "gain", "profit", "breakout", "rip"];
+    const bearishTerms = ["bearish", "short", "put", "dump", "crash", "down", "loss", "sell", "breakdown", "dead"];
+
+    let bullish = 0, bearish = 0;
+
+    for (const tweet of tweets) {
+      const text = (tweet.text || "").toLowerCase();
+      let postBullish = 0, postBearish = 0;
+
+      for (const term of bullishTerms) if (text.includes(term)) postBullish++;
+      for (const term of bearishTerms) if (text.includes(term)) postBearish++;
+
+      if (postBullish > postBearish) bullish++;
+      else if (postBearish > postBullish) bearish++;
+    }
+
+    const total = tweets.length || 1;
+    return {
+      bullish,
+      bearish,
+      total_tweets: tweets.length,
+      score: (bullish - bearish) / total,
+    };
+  }
+
+  async gatherSignals() {
+    // Get trending from StockTwits and search Twitter for those symbols
+    const signals = [];
+    const stocktwits = new StockTwitsAgent(this.logger);
+    const trending = await stocktwits.getTrending();
+
+    for (const sym of trending.slice(0, 10)) {
+      const tweets = await this.searchTweets(`$${sym.symbol}`, 50);
+      if (tweets.length < 5) continue;
+
+      const sentiment = this.analyzeSentiment(tweets);
+
+      signals.push({
+        symbol: sym.symbol,
+        source: "twitter",
+        sentiment: sentiment.score,
+        volume: sentiment.total_tweets,
+        bullish: sentiment.bullish,
+        bearish: sentiment.bearish,
+        reason: `Twitter: ${sentiment.bullish}B/${sentiment.bearish}b (${(sentiment.score * 100).toFixed(0)}%)`,
+      });
+
+      await sleep(200);
+    }
+
+    this.logger.log(this.name, "gathered_signals", { count: signals.length });
+    return signals;
+  }
+}
+
+// ============================================================================
 // LLM Analysis
 // ============================================================================
 
@@ -695,6 +793,7 @@ class SimpleOrchestrator {
 
     this.stocktwits = new StockTwitsAgent(this.logger);
     this.reddit = new RedditAgent(this.logger);
+    this.twitter = new TwitterAgent(this.logger);
     this.llmAnalyzer = new LLMAnalyzer(this.logger);
     this.executor = null;
     this.mcp = null;
@@ -735,9 +834,10 @@ class SimpleOrchestrator {
     this.logger.log("System", "gathering_data from all sources");
 
     // Gather in parallel
-    const [stocktwitsSignals, redditSignals] = await Promise.all([
+    const [stocktwitsSignals, redditSignals, twitterSignals] = await Promise.all([
       this.stocktwits.gatherSignals(),
       this.reddit.gatherSignals(),
+      this.twitter.gatherSignals(),
     ]);
 
     // Merge signals by symbol, averaging sentiment
@@ -759,6 +859,20 @@ class SimpleOrchestrator {
         existing.reason += ` | Reddit: ${sig.bullish}B/${sig.bearish}b`;
       } else {
         mergedSignals.set(sig.symbol, { ...sig, sources: ["reddit"] });
+      }
+    }
+
+    // Add Twitter signals, merging with existing
+    for (const sig of twitterSignals) {
+      if (mergedSignals.has(sig.symbol)) {
+        const existing = mergedSignals.get(sig.symbol);
+        // Average the sentiment scores
+        const combinedSentiment = (existing.sentiment + sig.sentiment) / 2;
+        existing.sentiment = combinedSentiment;
+        existing.sources.push("twitter");
+        existing.reason += ` | Twitter: ${sig.bullish}B/${sig.bearish}b`;
+      } else {
+        mergedSignals.set(sig.symbol, { ...sig, sources: ["twitter"] });
       }
     }
 
