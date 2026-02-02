@@ -805,7 +805,16 @@ Guidelines:
       }
 
       const data = await response.json();
-      const content = data.content?.[0]?.text;
+
+      // MiniMax returns content as blocks (thinking, text, etc.)
+      // Extract text from the first text-type block, or use thinking as fallback
+      let content = "";
+      if (data.content && Array.isArray(data.content)) {
+        const textBlock = data.content.find(block => block.type === "text");
+        content = textBlock?.text || data.content[0]?.thinking || "";
+      } else if (data.content) {
+        content = data.content;
+      }
 
       if (!content) {
         return null;
