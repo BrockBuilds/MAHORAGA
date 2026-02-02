@@ -170,29 +170,35 @@ export function SettingsModal({ config, onSave, onClose }: SettingsModalProps) {
             <h3 className="hud-label mb-3 text-hud-primary">LLM Configuration</h3>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="hud-label block mb-1">Research Model (cheap)</label>
+                <label className="hud-label block mb-1">LLM Provider</label>
                 <select
                   className="hud-input w-full"
                   value={localConfig.llm_model}
                   onChange={e => handleChange('llm_model', e.target.value)}
                 >
-                  <option value="gpt-4o-mini">gpt-4o-mini</option>
-                  <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
+                  <option value="MiniMax-M2.1">MiniMax M2.1 (configured)</option>
+                  <option value="claude-3-haiku">OpenRouter (claude-3-haiku)</option>
+                  <option value="gpt-4o-mini">OpenAI gpt-4o-mini</option>
+                  <option value="gpt-3.5-turbo">OpenAI gpt-3.5-turbo</option>
                 </select>
               </div>
               <div>
-                <label className="hud-label block mb-1">Analyst Model (smart)</label>
+                <label className="hud-label block mb-1">Analyst Model</label>
                 <select
                   className="hud-input w-full"
-                  value={localConfig.llm_analyst_model || 'gpt-4o'}
+                  value={localConfig.llm_analyst_model || 'MiniMax-M2.1'}
                   onChange={e => handleChange('llm_analyst_model', e.target.value)}
                 >
-                  <option value="gpt-5.2-2025-12-11">GPT-5.2 (best)</option>
+                  <option value="MiniMax-M2.1">MiniMax M2.1 (default)</option>
+                  <option value="claude-3-haiku">claude-3-haiku</option>
                   <option value="gpt-4o">gpt-4o</option>
-                  <option value="gpt-4o-mini">gpt-4o-mini (cheaper)</option>
+                  <option value="gpt-4o-mini">gpt-4o-mini</option>
                 </select>
               </div>
             </div>
+            <p className="hud-label text-xs mt-2 text-hud-muted">
+              MiniMax: configured | OpenRouter: requires API key | OpenAI: requires API key
+            </p>
           </div>
 
           {/* Account Config */}

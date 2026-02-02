@@ -788,6 +788,12 @@ Respond JSON only:
 
     const data = await response.json();
 
+    // Track costs (MiniMax uses token-based pricing)
+    const tokensIn = data.usage?.input_tokens || 0;
+    const tokensOut = data.usage?.output_tokens || 0;
+    const costUsd = (tokensIn * 0.0001 + tokensOut * 0.0001); // Approximate MiniMax pricing
+    this.logger.log("Costs", "llm_minimax", { tokens_in: tokensIn, tokens_out: tokensOut, usd: costUsd });
+
     // Extract content from thinking/text blocks
     let content = "";
     if (data.content && Array.isArray(data.content)) {
@@ -837,6 +843,13 @@ Respond JSON only:
     }
 
     const data = await response.json();
+
+    // Track costs (OpenRouter uses token-based pricing)
+    const tokensIn = data.usage?.prompt_tokens || 0;
+    const tokensOut = data.usage?.completion_tokens || 0;
+    const costUsd = (tokensIn * 0.00001 + tokensOut * 0.00004); // Approximate OpenRouter pricing
+    this.logger.log("Costs", "llm_openrouter", { tokens_in: tokensIn, tokens_out: tokensOut, usd: costUsd });
+
     const content = data.choices?.[0]?.message?.content;
 
     if (!content) {
@@ -2030,8 +2043,12 @@ class SimpleOrchestrator {
       monthlyDrawdown = this.logger.getDrawdownPct("monthly", account.equity);
     }
 
+    // Get LLM provider info
+    const llmProvider = this.llmAnalyzer?.getProvider();
+    const llmModel = llmProvider === "minimax" ? "MiniMax-M2.1" : (llmProvider === "openrouter" ? "claude-3-haiku" : "none");
+
     return {
-      config: this.config,
+      config: { ...this.config, llm_model: llmModel },
       signals: this.signalCache,
       logs: this.logger.getRecentLogs(100),
       costs: this.logger.getCosts(),
