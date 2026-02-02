@@ -426,13 +426,13 @@ export default function App() {
           <div className="col-span-4 md:col-span-8 lg:col-span-4">
             <Panel title="LLM COSTS" className="h-full">
               <div className="grid grid-cols-2 gap-4">
-                <Metric label="TOTAL SPENT" value={`$${costs.total_usd.toFixed(4)}`} size="lg" />
-                <Metric label="API CALLS" value={costs.calls.toString()} size="lg" />
-                <MetricInline label="TOKENS IN" value={costs.tokens_in.toLocaleString()} />
-                <MetricInline label="TOKENS OUT" value={costs.tokens_out.toLocaleString()} />
+                <Metric label="TOTAL SPENT" value={`$${(costs.total_usd ?? 0).toFixed(4)}`} size="lg" />
+                <Metric label="API CALLS" value={(costs.calls ?? 0).toString()} size="lg" />
+                <MetricInline label="TOKENS IN" value={(costs.tokens_in ?? 0).toLocaleString()} />
+                <MetricInline label="TOKENS OUT" value={(costs.tokens_out ?? 0).toLocaleString()} />
                 <MetricInline 
                   label="AVG COST/CALL" 
-                  value={costs.calls > 0 ? `$${(costs.total_usd / costs.calls).toFixed(6)}` : '$0'} 
+                  value={(costs.calls ?? 0) > 0 ? `$${((costs.total_usd ?? 0) / (costs.calls ?? 0)).toFixed(6)}` : '$0'} 
                 />
                 <MetricInline label="MODEL" value={config?.llm_model || 'gpt-4o-mini'} />
               </div>
