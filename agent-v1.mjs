@@ -864,10 +864,11 @@ Guidelines:
 // ============================================================================
 
 class TradingExecutor {
-  constructor(mcpClient, logger, config) {
+  constructor(mcpClient, logger, config, alertSystem = null) {
     this.mcp = mcpClient;
     this.logger = logger;
     this.config = config;
+    this.alertSystem = alertSystem;
     this.name = "Executor";
     this.lastTrades = new Map();
   }
@@ -933,23 +934,44 @@ class TradingExecutor {
         size: positionSize.toFixed(2),
         reason: reasonText,
       });
+      if (this.alertSystem) {
+        this.alertSystem.sendAlert("trade_executed", `BUY ${symbol} - $${positionSize.toFixed(2)}`, {
+          symbol,
+          side: "buy",
+          size: positionSize,
+          reason: reasonText,
+        });
+      }
       return submit.data.order;
     } else {
       this.logger.log(this.name, "buy_failed", { symbol, error: submit.error?.message });
+      if (this.alertSystem) {
+        this.alertSystem.sendAlert("error", `Buy failed for ${symbol}: ${submit.error?.message}`, { symbol, error: submit.error?.message });
+      }
       return null;
     }
   }
 
   async executeSell(symbol, reason) {
     this.logger.log(this.name, "sell_initiated", { symbol, reason });
-    
+
     const result = await this.callTool("positions-close", { symbol });
-    
+
     if (result.ok) {
       this.logger.log(this.name, "sell_executed", { symbol, reason });
+      if (this.alertSystem) {
+        this.alertSystem.sendAlert("trade_executed", `SELL ${symbol} - ${reason}`, {
+          symbol,
+          side: "sell",
+          reason,
+        });
+      }
       return result.data.order;
     } else {
       this.logger.log(this.name, "sell_failed", { symbol, error: result.error?.message });
+      if (this.alertSystem) {
+        this.alertSystem.sendAlert("error", `Sell failed for ${symbol}: ${result.error?.message}`, { symbol, error: result.error?.message });
+      }
       return null;
     }
   }
@@ -1192,6 +1214,105 @@ class PaperTraderReporter {
 }
 
 // ============================================================================
+// Alert System
+// ============================================================================
+
+class AlertSystem {
+  constructor(logger) {
+    this.logger = logger;
+    this.name = "AlertSystem";
+    this.alerts = [];
+    this.alertTypes = {
+      trade_executed: { priority: "info", threshold: null },
+      trade_skipped: { priority: "low", threshold: null },
+      drawdown_warning: { priority: "high", threshold: 1.5 }, // 1.5x daily limit
+      drawdown_limit_hit: { priority: "critical", threshold: 1.0 },
+      llm_decision: { priority: "info", threshold: null },
+      market_event: { priority: "medium", threshold: null },
+      error: { priority: "high", threshold: null },
+    };
+  }
+
+  sendAlert(type, message, data = {}) {
+    const alertType = this.alertTypes[type] || { priority: "info", threshold: null };
+    const alert = {
+      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      type,
+      priority: alertType.priority,
+      message,
+      data,
+      timestamp: new Date().toISOString(),
+      read: false,
+    };
+
+    this.alerts.unshift(alert); // Add to front
+    this.alerts = this.alerts.slice(0, 100); // Keep last 100
+
+    this.logger.log(this.name, "alert_sent", {
+      type,
+      priority: alertType.priority,
+      message: message.substring(0, 100),
+    });
+
+    return alert;
+  }
+
+  getAlerts(filters = {}) {
+    let results = this.alerts;
+
+    if (filters.type) {
+      results = results.filter(a => a.type === filters.type);
+    }
+    if (filters.priority) {
+      results = results.filter(a => a.priority === filters.priority);
+    }
+    if (filters.unread_only) {
+      results = results.filter(a => !a.read);
+    }
+    if (filters.limit) {
+      results = results.slice(0, filters.limit);
+    }
+
+    return results;
+  }
+
+  markAsRead(alertId) {
+    const alert = this.alerts.find(a => a.id === alertId);
+    if (alert) {
+      alert.read = true;
+    }
+  }
+
+  markAllAsRead() {
+    for (const alert of this.alerts) {
+      alert.read = true;
+    }
+  }
+
+  getUnreadCount() {
+    return this.alerts.filter(a => !a.read).length;
+  }
+
+  getSummary() {
+    const total = this.alerts.length;
+    const unread = this.getUnreadCount();
+    const byPriority = {
+      critical: this.alerts.filter(a => a.priority === "critical").length,
+      high: this.alerts.filter(a => a.priority === "high").length,
+      medium: this.alerts.filter(a => a.priority === "medium").length,
+      low: this.alerts.filter(a => a.priority === "low").length,
+      info: this.alerts.filter(a => a.priority === "info").length,
+    };
+
+    return {
+      total,
+      unread,
+      by_priority: byPriority,
+    };
+  }
+}
+
+// ============================================================================
 // Main Orchestrator
 // ============================================================================
 
@@ -1212,6 +1333,7 @@ class SimpleOrchestrator {
     this.fundamentals = new FundamentalsAgent(this.logger);
     this.backtester = new Backtester(this.logger);
     this.paperReporter = new PaperTraderReporter(this.logger);
+    this.alerts = new AlertSystem(this.logger);
     this.llmAnalyzer = new LLMAnalyzer(this.logger);
     this.executor = null;
     this.mcp = null;
@@ -1225,7 +1347,7 @@ class SimpleOrchestrator {
       const transport = new SSEClientTransport(new URL(url));
       this.mcp = new Client({ name: "mahoraga-v1", version: "1.0" }, { capabilities: {} });
       await this.mcp.connect(transport);
-      this.executor = new TradingExecutor(this.mcp, this.logger, this.config);
+      this.executor = new TradingExecutor(this.mcp, this.logger, this.config, this.alerts);
       this.logger.log("System", "connected", { url });
       return true;
     } catch (err) {
@@ -1842,6 +1964,36 @@ function startDashboardAPI(orchestrator) {
         const metrics = orchestrator.paperReporter.getPerformanceMetrics();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, data: metrics }));
+      } else if (url.pathname === "/api/alerts") {
+        const limit = parseInt(url.searchParams.get("limit") || "20");
+        const type = url.searchParams.get("type") || null;
+        const priority = url.searchParams.get("priority") || null;
+        const unreadOnly = url.searchParams.get("unread_only") === "true";
+        const alerts = orchestrator.alerts.getAlerts({ limit, type, priority, unread_only: unreadOnly });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, data: alerts }));
+      } else if (url.pathname === "/api/alerts/summary") {
+        const summary = orchestrator.alerts.getSummary();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, data: summary }));
+      } else if (url.pathname === "/api/alerts/mark-read" && req.method === "POST") {
+        let body = "";
+        req.on("data", (chunk) => body += chunk);
+        req.on("end", () => {
+          try {
+            const { alert_id, mark_all } = JSON.parse(body || "{}");
+            if (mark_all) {
+              orchestrator.alerts.markAllAsRead();
+            } else if (alert_id) {
+              orchestrator.alerts.markAsRead(alert_id);
+            }
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
       } else {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "Not found" }));
@@ -1854,14 +2006,17 @@ function startDashboardAPI(orchestrator) {
 
   server.listen(PORT, () => {
     console.log(`Dashboard API: http://localhost:${PORT}`);
-    console.log(`  GET  /api/status           - Full status`);
-    console.log(`  GET  /api/config           - Get config`);
-    console.log(`  POST /api/config           - Update config`);
-    console.log(`  GET  /api/logs             - Activity logs`);
-    console.log(`  POST /api/backtest         - Run backtest`);
-    console.log(`  POST /api/backtest/compare - Compare strategies`);
-    console.log(`  GET  /api/paper/report     - Paper trading report`);
-    console.log(`  GET  /api/paper/performance - Performance metrics\n`);
+    console.log(`  GET  /api/status             - Full status`);
+    console.log(`  GET  /api/config             - Get config`);
+    console.log(`  POST /api/config             - Update config`);
+    console.log(`  GET  /api/logs               - Activity logs`);
+    console.log(`  POST /api/backtest           - Run backtest`);
+    console.log(`  POST /api/backtest/compare   - Compare strategies`);
+    console.log(`  GET  /api/paper/report       - Paper trading report`);
+    console.log(`  GET  /api/paper/performance  - Performance metrics`);
+    console.log(`  GET  /api/alerts             - Get alerts`);
+    console.log(`  GET  /api/alerts/summary     - Alert summary`);
+    console.log(`  POST /api/alerts/mark-read   - Mark alerts as read\n`);
   });
 }
 
