@@ -1515,37 +1515,15 @@ class SimpleOrchestrator {
     this.executor = null;
     this.mcp = null;
     this.useDirectAlpaca = false;
-  }
 
-  async connect() {
-    const url = this.config.mcp_url;
-    console.log(`Connecting to MCP server at ${url}...`);
+    // Try direct Alpaca API first (no MCP needed)
+    this.executor = new AlpacaDirectExecutor(this.logger, this.config, this.alerts);
 
-    try {
-      const transport = new SSEClientTransport(new URL(url));
-      const mcp = new Client({ name: "mahoraga-v1", version: "1.0" }, { capabilities: {} });
-      await mcp.connect(transport);
-      this.mcp = mcp;
-      this.executor = new TradingExecutor(this.mcp, this.logger, this.config, this.alerts);
-      this.logger.log("System", "connected", { url });
-      return true;
-    } catch (err) {
-      console.warn("MCP connection failed, trying direct Alpaca API...");
-      this.mcp = null;
-
-      // Try direct Alpaca API
-      this.executor = new AlpacaDirectExecutor(this.logger, this.config, this.alerts);
-
-      if (this.executor.isConfigured()) {
-        this.useDirectAlpaca = true;
-        this.logger.log("System", "direct_alpaca", { message: "Using direct Alpaca API" });
-        console.warn("Using direct Alpaca API (paper trading)");
-        return true;
-      }
-
-      this.executor = null;
-      this.logger.log("System", "connection_failed", { error: err.message });
-      return false;
+    if (this.executor.isConfigured()) {
+      this.useDirectAlpaca = true;
+      console.log("Alpaca API: Connected (paper trading)");
+    } else {
+      console.warn("Alpaca API: Not configured (will use mock data)");
     }
   }
 
@@ -1954,9 +1932,7 @@ class SimpleOrchestrator {
     console.log("  MAHORAGA v1 - Simple Trading Agent");
     console.log("========================================\n");
 
-    const connected = await this.connect();
-
-    // Get initial state
+    // Get initial account state
     let state;
     try {
       state = await this.getAccountState();
@@ -1964,29 +1940,27 @@ class SimpleOrchestrator {
       state = { account: null, positions: [], clock: { is_open: false } };
     }
 
-    if (!connected) {
-      console.warn("MCP server not available - running in OFFLINE MODE");
-      console.warn("Trading functionality disabled, dashboard API available\n");
+    if (this.useDirectAlpaca) {
+      console.log("Direct Alpaca API: Connected (paper trading)");
+    } else {
+      console.warn("Alpaca API: Not configured - running in DEMO MODE");
     }
 
     if (state.account) {
-      console.log(`Equity: $${state.account.equity.toFixed(2)} | Cash: $${state.account.cash.toFixed(2)} | Positions: ${state.positions.length}`);
+      const equity = parseFloat(state.account.equity) || 0;
+      const cash = parseFloat(state.account.cash) || 0;
+      console.log(`Equity: $${equity.toFixed(2)} | Cash: $${cash.toFixed(2)} | Positions: ${state.positions.length}`);
     }
     console.log(`Market: ${state.clock?.is_open ? "OPEN" : "CLOSED"}\n`);
 
     // Save config
     saveConfig(this.config);
 
-    // Run initial data gathering (only if connected)
-    if (connected) {
-      await this.runDataGatherers();
-    } else {
-      // Offline mode: just show API is working
-      this.logger.log("System", "offline_mode", { message: "Running without MCP connection" });
-    }
+    // Run initial data gathering
+    await this.runDataGatherers();
 
-    // Don't run trading logic in offline mode
-    if (connected && state.clock?.is_open) {
+    // Run trading logic if market is open
+    if (state.clock?.is_open) {
       await this.runTradingLogic();
     }
 
@@ -2069,7 +2043,7 @@ function sleep(ms) {
 // ============================================================================
 
 function startDashboardAPI(orchestrator) {
-  const PORT = orchestrator.config.dashboard_port || process.env.DASHBOARD_PORT || 3001;
+  const PORT = parseInt(process.env.DASHBOARD_PORT || process.env.PORT || "5000");
   
   const server = http.createServer(async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -2264,6 +2238,15 @@ function startDashboardAPI(orchestrator) {
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
+  });
+
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`Port ${PORT} is already in use. Another instance may be running.`);
+      console.log(`Dashboard API not started (port ${PORT} in use)`);
+    } else {
+      console.error("Dashboard server error:", err);
     }
   });
 
