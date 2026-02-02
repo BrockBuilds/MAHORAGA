@@ -2291,10 +2291,21 @@ function startDashboardAPI(orchestrator) {
             const { action, confirm_sell } = JSON.parse(body || "{}");
             
             if (action === "enable") {
+              // Sell all positions first, then enable kill switch
+              const positions = await orchestrator.executor.getPositions();
+              if (positions.ok && positions.data.length > 0) {
+                for (const pos of positions.data) {
+                  await orchestrator.executor.closePosition(pos.symbol);
+                  orchestrator.logger.log("System", "emergency_sell", { symbol: pos.symbol, qty: pos.qty });
+                }
+              }
               orchestrator.killSwitch = true;
-              orchestrator.logger.log("System", "kill_switch_enabled", { message: "Trading halted by user" });
+              orchestrator.logger.log("System", "kill_switch_enabled", { 
+                message: "Trading halted - all positions closed",
+                positions_closed: positions.data?.length || 0
+              });
               res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ ok: true, status: "enabled", message: "Kill switch enabled - no new trades will be made" }));
+              res.end(JSON.stringify({ ok: true, status: "enabled", message: "Kill switch enabled - all positions closed" }));
             } else if (action === "disable") {
               orchestrator.killSwitch = false;
               orchestrator.logger.log("System", "kill_switch_disabled", { message: "Trading resumed by user" });

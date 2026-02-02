@@ -163,10 +163,6 @@ export default function App() {
     }
   }, [setupChecked, showSetup, refreshTrigger])
 
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [status?.logs])
-
   const handleSaveConfig = async (config: Config) => {
     const res = await fetch(`${API_BASE}/config`, {
       method: 'POST',
