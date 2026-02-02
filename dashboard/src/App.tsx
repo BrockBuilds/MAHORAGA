@@ -217,7 +217,7 @@ export default function App() {
   const tradeHistory = useMemo(() => {
     const trades: LogEntry[] = []
     logs.forEach(log => {
-      if ((log.action === 'buy_executed' || log.action === 'sell_executed') && log.symbol) {
+      if ((log.action === 'buy_executed' || log.action === 'sell_executed' || log.action === 'emergency_sell') && log.symbol) {
         trades.push(log)
       }
     })
@@ -614,6 +614,7 @@ export default function App() {
                   tradeHistory.map((log: LogEntry, i: number) => {
                     const qty = typeof log.qty === 'number' ? log.qty : Number(log.qty)
                     const price = typeof log.price === 'number' ? log.price : Number(log.price)
+                    const isBuy = log.action === 'buy_executed'
                     return (
                     <motion.div 
                       key={`${log.timestamp}-${i}`}
@@ -621,15 +622,15 @@ export default function App() {
                       animate={{ opacity: 1 }}
                       className={clsx(
                         "flex items-center justify-between py-1 px-2 border-b border-hud-line/10",
-                        log.action === 'buy_executed' ? 'bg-hud-success/5' : 'bg-hud-error/5'
+                        isBuy ? 'bg-hud-success/5' : 'bg-hud-error/5'
                       )}
                     >
                       <div className="flex items-center gap-2">
                         <span className={clsx(
                           'hud-value-sm font-bold',
-                          log.action === 'buy_executed' ? 'text-hud-success' : 'text-hud-error'
+                          isBuy ? 'text-hud-success' : 'text-hud-error'
                         )}>
-                          {log.action === 'buy_executed' ? 'BUY' : 'SELL'}
+                          {isBuy ? 'BUY' : 'SELL'}
                         </span>
                         <span className="text-hud-primary">{log.symbol}</span>
                       </div>
