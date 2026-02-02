@@ -97,6 +97,7 @@ export default function App() {
   const [setupChecked, setSetupChecked] = useState(false)
   const [time, setTime] = useState(new Date())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioSnapshot[]>([])
+  const [refreshTrigger, setRefreshTrigger] = useState(0)
   const logsEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -160,7 +161,7 @@ export default function App() {
         clearInterval(timeInterval)
       }
     }
-  }, [setupChecked, showSetup])
+  }, [setupChecked, showSetup, refreshTrigger])
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -281,6 +282,26 @@ export default function App() {
               overnightActivity={status?.overnightActivity}
               premarketPlan={status?.premarketPlan}
             />
+            <button 
+              className={clsx(
+                "hud-label transition-colors",
+                status?.killSwitch ? "text-hud-error animate-pulse" : "hover:text-hud-primary"
+              )}
+              onClick={async () => {
+                try {
+                  await fetch('/api/kill-switch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: status?.killSwitch ? 'disable' : 'enable' })
+                  });
+                  setRefreshTrigger(prev => prev + 1); // Trigger status refresh
+                } catch (e) {
+                  console.error('Failed to toggle kill switch:', e);
+                }
+              }}
+            >
+              {status?.killSwitch ? '[KILL SWITCH ON]' : '[KILL SWITCH OFF]'}
+            </button>
             <button 
               className="hud-label hover:text-hud-primary transition-colors"
               onClick={() => setShowSettings(true)}

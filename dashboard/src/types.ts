@@ -193,6 +193,7 @@ export interface Status {
   costs: CostTracker
   lastAnalystRun: number
   lastResearchRun: number
+  killSwitch: boolean
   signalResearch: Record<string, SignalResearch>
   positionResearch: Record<string, PositionResearch>
   portfolioHistory?: PortfolioSnapshot[]

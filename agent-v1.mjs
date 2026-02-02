@@ -1534,6 +1534,7 @@ class SimpleOrchestrator {
     this.logger = new ActivityLogger();
     this.signalCache = [];
     this.lastAnalystRun = 0;
+    this.killSwitch = false; // Emergency stop - prevents new trades
 
     // Position tracking for trailing stops and volatility
     this.positionTracking = new Map(); // symbol -> { entryPrice, peakPrice, avgPrice, lastQuote }
@@ -1728,6 +1729,11 @@ class SimpleOrchestrator {
     if (!clock?.is_open) {
       this.logger.log("System", "market_closed");
       return { allowed: false, reason: "Market closed" };
+    }
+
+    if (this.killSwitch) {
+      this.logger.log("System", "skipped_trading", { reason: "Kill switch active" });
+      return { allowed: false, reason: "Kill switch active - trading paused" };
     }
 
     // Initialize drawdown tracking if needed
@@ -2053,6 +2059,7 @@ class SimpleOrchestrator {
       logs: this.logger.getRecentLogs(100),
       costs: this.logger.getCosts(),
       lastAnalystRun: this.lastAnalystRun,
+      killSwitch: this.killSwitch,
       drawdown: {
         daily: dailyDrawdown,
         weekly: weeklyDrawdown,
@@ -2270,6 +2277,53 @@ function startDashboardAPI(orchestrator) {
             }
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: true }));
+          } catch (e) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: e.message }));
+          }
+        });
+      } else if (url.pathname === "/api/kill-switch" && req.method === "POST") {
+        // Emergency stop - sells all positions and stops trading
+        let body = "";
+        req.on("data", (chunk) => body += chunk);
+        req.on("end", async () => {
+          try {
+            const { action, confirm_sell } = JSON.parse(body || "{}");
+            
+            if (action === "enable") {
+              orchestrator.killSwitch = true;
+              orchestrator.logger.log("System", "kill_switch_enabled", { message: "Trading halted by user" });
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: true, status: "enabled", message: "Kill switch enabled - no new trades will be made" }));
+            } else if (action === "disable") {
+              orchestrator.killSwitch = false;
+              orchestrator.logger.log("System", "kill_switch_disabled", { message: "Trading resumed by user" });
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: true, status: "disabled", message: "Kill switch disabled - trading resumed" }));
+            } else if (action === "sell-all") {
+              // Sell all positions
+              if (confirm_sell !== true) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "Confirmation required. Set confirm_sell: true" }));
+                return;
+              }
+              
+              const positions = await orchestrator.executor.getPositions();
+              if (positions.ok && positions.data.length > 0) {
+                for (const pos of positions.data) {
+                  await orchestrator.executor.closePosition(pos.symbol);
+                  orchestrator.logger.log("System", "emergency_sell", { symbol: pos.symbol, qty: pos.qty });
+                }
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: true, message: `Sold ${positions.data.length} positions` }));
+              } else {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: true, message: "No positions to sell" }));
+              }
+            } else {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: false, error: "Invalid action. Use: enable, disable, or sell-all" }));
+            }
           } catch (e) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: e.message }));
