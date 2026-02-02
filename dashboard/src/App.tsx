@@ -9,7 +9,7 @@ import { SetupWizard } from './components/SetupWizard'
 import { LineChart, Sparkline } from './components/LineChart'
 import { NotificationBell } from './components/NotificationBell'
 import { Tooltip, TooltipContent } from './components/Tooltip'
-import type { Status, Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
+import type { Status, Config, LogEntry, Signal, Position, PortfolioSnapshot } from './types'
 
 const API_BASE = '/api'
 
@@ -37,19 +37,6 @@ function getAgentColor(agent: string): string {
     'System': 'text-hud-text-dim',
   }
   return colors[agent] || 'text-hud-text'
-}
-
-function getVerdictColor(verdict: string): string {
-  if (verdict === 'BUY') return 'text-hud-success'
-  if (verdict === 'SKIP') return 'text-hud-error'
-  return 'text-hud-warning'
-}
-
-function getQualityColor(quality: string): string {
-  if (quality === 'excellent') return 'text-hud-success'
-  if (quality === 'good') return 'text-hud-primary'
-  if (quality === 'fair') return 'text-hud-warning'
-  return 'text-hud-error'
 }
 
 function getSentimentColor(score: number): string {
@@ -591,56 +578,55 @@ export default function App() {
           </div>
 
           <div className="col-span-4 md:col-span-8 lg:col-span-4">
-            <Panel title="SIGNAL RESEARCH" titleRight={Object.keys(status?.signalResearch || {}).length.toString()} className="h-80">
+            <Panel title="SIGNAL RESEARCH" titleRight={(status?.signals || []).length.toString()} className="h-80">
               <div className="overflow-y-auto h-full space-y-2">
-                {Object.entries(status?.signalResearch || {}).length === 0 ? (
-                  <div className="text-hud-text-dim text-sm py-4 text-center">Researching candidates...</div>
+                {(status?.signals || []).length === 0 ? (
+                  <div className="text-hud-text-dim text-sm py-4 text-center">Gathering signals...</div>
                 ) : (
-                  Object.entries(status?.signalResearch || {}).map(([symbol, research]: [string, SignalResearch]) => (
+                  (status?.signals || []).slice(0, 10).map((signal: Signal) => (
                     <Tooltip
-                      key={symbol}
+                      key={signal.symbol}
                       position="left"
                       content={
                         <div className="space-y-2 min-w-[200px]">
                           <div className="hud-label text-hud-primary border-b border-hud-line/50 pb-1">
-                            {symbol} DETAILS
+                            {signal.symbol} DETAILS
                           </div>
                           <div className="space-y-1">
                             <div className="flex justify-between">
-                              <span className="text-hud-text-dim">Confidence</span>
-                              <span className="text-hud-text-bright">{(research.confidence * 100).toFixed(0)}%</span>
-                            </div>
-                            <div className="flex justify-between">
                               <span className="text-hud-text-dim">Sentiment</span>
-                              <span className={getSentimentColor(research.sentiment)}>
-                                {(research.sentiment * 100).toFixed(0)}%
+                              <span className={getSentimentColor(signal.sentiment)}>
+                                {(signal.sentiment * 100).toFixed(0)}%
                               </span>
                             </div>
                             <div className="flex justify-between">
-                              <span className="text-hud-text-dim">Analyzed</span>
-                              <span className="text-hud-text">
-                                {new Date(research.timestamp).toLocaleTimeString('en-US', { hour12: false })}
-                              </span>
+                              <span className="text-hud-text-dim">Bullish</span>
+                              <span className="text-hud-text-bright">{signal.bullish || 0}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-hud-text-dim">Bearish</span>
+                              <span className="text-hud-error">{signal.bearish || 0}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-hud-text-dim">Volume</span>
+                              <span className="text-hud-text">{signal.volume || 0}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-hud-text-dim">Source</span>
+                              <span className="text-hud-text uppercase">{signal.source}</span>
                             </div>
                           </div>
-                          {research.catalysts.length > 0 && (
+                          {signal.llm_decision && (
                             <div className="pt-1 border-t border-hud-line/30">
-                              <span className="text-[9px] text-hud-text-dim">CATALYSTS:</span>
-                              <ul className="mt-1 space-y-0.5">
-                                {research.catalysts.map((c, i) => (
-                                  <li key={i} className="text-[10px] text-hud-success">+ {c}</li>
-                                ))}
-                              </ul>
-                            </div>
-                          )}
-                          {research.red_flags.length > 0 && (
-                            <div className="pt-1 border-t border-hud-line/30">
-                              <span className="text-[9px] text-hud-text-dim">RED FLAGS:</span>
-                              <ul className="mt-1 space-y-0.5">
-                                {research.red_flags.map((f, i) => (
-                                  <li key={i} className="text-[10px] text-hud-error">- {f}</li>
-                                ))}
-                              </ul>
+                              <span className="text-[9px] text-hud-text-dim">LLM:</span>
+                              <p className="text-[10px] mt-1">
+                                <span className={clsx(
+                                  signal.llm_decision === 'BUY' ? 'text-hud-success' :
+                                  signal.llm_decision === 'SKIP' ? 'text-hud-text-dim' :
+                                  'text-hud-warning'
+                                )}>{signal.llm_decision}</span>
+                                {signal.llm_confidence && ` (${(signal.llm_confidence * 100).toFixed(0)}%)`}
+                              </p>
                             </div>
                           )}
                         </div>
@@ -652,26 +638,26 @@ export default function App() {
                         className="p-2 border border-hud-line/30 rounded hover:border-hud-line/60 cursor-help transition-colors"
                       >
                         <div className="flex justify-between items-center mb-1">
-                          <span className="hud-value-sm">{symbol}</span>
+                          <span className="hud-value-sm">{signal.symbol}</span>
                           <div className="flex items-center gap-2">
-                            <span className={clsx('hud-label', getQualityColor(research.entry_quality))}>
-                              {research.entry_quality.toUpperCase()}
+                            <span className={clsx('hud-value-sm font-bold', getSentimentColor(signal.sentiment))}>
+                              {(signal.sentiment * 100).toFixed(0)}%
                             </span>
-                            <span className={clsx('hud-value-sm font-bold', getVerdictColor(research.verdict))}>
-                              {research.verdict}
-                            </span>
+                            {signal.llm_decision && (
+                              <span className={clsx(
+                                'hud-label text-[10px]',
+                                signal.llm_decision === 'BUY' ? 'text-hud-success' :
+                                signal.llm_decision === 'SKIP' ? 'text-hud-text-dim' :
+                                'text-hud-warning'
+                              )}>
+                                {signal.llm_decision}
+                              </span>
+                            )}
                           </div>
                         </div>
-                        <p className="text-xs text-hud-text-dim leading-tight mb-1">{research.reasoning}</p>
-                        {research.red_flags.length > 0 && (
-                          <div className="flex flex-wrap gap-1">
-                            {research.red_flags.slice(0, 2).map((flag, i) => (
-                              <span key={i} className="text-xs text-hud-error bg-hud-error/10 px-1 rounded">
-                                {flag.slice(0, 30)}...
-                              </span>
-                            ))}
-                          </div>
-                        )}
+                        <p className="text-xs text-hud-text-dim leading-tight">
+                          {signal.reason?.slice(0, 60)}...
+                        </p>
                       </motion.div>
                     </Tooltip>
                   ))

@@ -30,6 +30,9 @@ export interface Signal {
   bearish?: number
   score?: number
   upvotes?: number
+  llm_decision?: 'BUY' | 'SKIP' | 'WAIT'
+  llm_confidence?: number
+  llm_reasoning?: string
 }
 
 export interface LogEntry {
