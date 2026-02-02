@@ -1342,22 +1342,38 @@ class SimpleOrchestrator {
   async connect() {
     const url = this.config.mcp_url;
     console.log(`Connecting to MCP server at ${url}...`);
-    
+
     try {
       const transport = new SSEClientTransport(new URL(url));
-      this.mcp = new Client({ name: "mahoraga-v1", version: "1.0" }, { capabilities: {} });
-      await this.mcp.connect(transport);
+      const mcp = new Client({ name: "mahoraga-v1", version: "1.0" }, { capabilities: {} });
+      await mcp.connect(transport);
+      this.mcp = mcp;
       this.executor = new TradingExecutor(this.mcp, this.logger, this.config, this.alerts);
       this.logger.log("System", "connected", { url });
       return true;
     } catch (err) {
       console.error("Connection error:", err);
+      this.mcp = null;
+      this.executor = null;
       this.logger.log("System", "connection_failed", { error: err.message });
       return false;
     }
   }
 
   async getAccountState() {
+    // Return mock data if not connected to MCP
+    if (!this.mcp) {
+      return {
+        account: {
+          equity: this.config.starting_equity || 100000,
+          cash: (this.config.starting_equity || 100000) * 0.7,
+          buying_power: (this.config.starting_equity || 100000) * 0.7,
+        },
+        positions: [],
+        clock: { is_open: true, next_open: new Date().toISOString(), next_close: new Date().toISOString() },
+      };
+    }
+
     const [account, positions, clock] = await Promise.all([
       this.executor.callTool("accounts-get"),
       this.executor.callTool("positions-list"),
@@ -1704,26 +1720,40 @@ class SimpleOrchestrator {
     console.log("\n========================================");
     console.log("  MAHORAGA v1 - Simple Trading Agent");
     console.log("========================================\n");
-    
-    if (!(await this.connect())) {
-      console.error("Failed to connect. Make sure MCP server is running: npm run dev");
-      process.exit(1);
+
+    const connected = await this.connect();
+
+    // Get initial state
+    let state;
+    try {
+      state = await this.getAccountState();
+    } catch (e) {
+      state = { account: null, positions: [], clock: { is_open: false } };
     }
 
-    // Initial state
-    const { account, positions, clock } = await this.getAccountState();
-    if (account) {
-      console.log(`Equity: $${account.equity.toFixed(2)} | Cash: $${account.cash.toFixed(2)} | Positions: ${positions.length}`);
+    if (!connected) {
+      console.warn("MCP server not available - running in OFFLINE MODE");
+      console.warn("Trading functionality disabled, dashboard API available\n");
     }
-    console.log(`Market: ${clock?.is_open ? "OPEN" : "CLOSED"}\n`);
+
+    if (state.account) {
+      console.log(`Equity: $${state.account.equity.toFixed(2)} | Cash: $${state.account.cash.toFixed(2)} | Positions: ${state.positions.length}`);
+    }
+    console.log(`Market: ${state.clock?.is_open ? "OPEN" : "CLOSED"}\n`);
 
     // Save config
     saveConfig(this.config);
 
-    // Run initial data gathering
-    await this.runDataGatherers();
-    
-    if (clock?.is_open) {
+    // Run initial data gathering (only if connected)
+    if (connected) {
+      await this.runDataGatherers();
+    } else {
+      // Offline mode: just show API is working
+      this.logger.log("System", "offline_mode", { message: "Running without MCP connection" });
+    }
+
+    // Don't run trading logic in offline mode
+    if (connected && state.clock?.is_open) {
       await this.runTradingLogic();
     }
 
