@@ -776,7 +776,7 @@ Respond JSON only:
         model: "minimax/MiniMax-M2.1",
         messages: [{ role: "user", content: prompt }],
         temperature: 0.3,
-        max_tokens: 300,
+        max_tokens: 600,
       }),
     });
 
@@ -826,7 +826,7 @@ Respond JSON only:
         model: "anthropic/claude-3-haiku", // Default, can be overridden
         messages: [{ role: "user", content: prompt }],
         temperature: 0.3,
-        max_tokens: 300,
+        max_tokens: 600,
       }),
     });
 
