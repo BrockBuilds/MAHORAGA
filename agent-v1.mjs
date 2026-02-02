@@ -860,7 +860,184 @@ Guidelines:
 }
 
 // ============================================================================
-// Trading Executor
+// Alpaca Direct Executor (No MCP Server Needed)
+// ============================================================================
+
+class AlpacaDirectExecutor {
+  constructor(logger, config, alertSystem = null) {
+    this.logger = logger;
+    this.config = config;
+    this.alertSystem = alertSystem;
+    this.name = "AlpacaDirect";
+    this.lastTrades = new Map();
+
+    // Load Alpaca credentials
+    this.apiKey = process.env.ALPACA_API_KEY;
+    this.apiSecret = process.env.ALPACA_API_SECRET;
+    this.paper = process.env.ALPACA_PAPER === "true";
+
+    this.baseUrl = this.paper
+      ? "https://paper-api.alpaca.markets"
+      : "https://api.alpaca.markets";
+
+    this.headers = {
+      "APCA-API-KEY-ID": this.apiKey,
+      "APCA-API-SECRET-KEY": this.apiSecret,
+      "Content-Type": "application/json",
+    };
+  }
+
+  isConfigured() {
+    return !!(this.apiKey && this.apiSecret);
+  }
+
+  async request(method, endpoint, body = null) {
+    try {
+      const options = {
+        method,
+        headers: this.headers,
+      };
+
+      if (body) {
+        options.body = JSON.stringify(body);
+      }
+
+      const response = await fetch(`${this.baseUrl}${endpoint}`, options);
+      const data = await response.json();
+
+      if (!response.ok) {
+        this.logger.log(this.name, "api_error", { endpoint, status: response.status, error: data.message || data.error });
+        return { ok: false, error: data.message || data.error };
+      }
+
+      return { ok: true, data };
+    } catch (err) {
+      this.logger.log(this.name, "request_error", { endpoint, error: err.message });
+      return { ok: false, error: err.message };
+    }
+  }
+
+  async getAccount() {
+    return this.request("GET", "/v2/account");
+  }
+
+  async getPositions() {
+    return this.request("GET", "/v2/positions");
+  }
+
+  async closePosition(symbol) {
+    return this.request("DELETE", `/v2/positions/${symbol}`);
+  }
+
+  async createOrder(symbol, qty, side, orderType = "market", timeInForce = "day") {
+    return this.request("POST", "/v2/orders", {
+      symbol,
+      qty,
+      side,
+      type: orderType,
+      time_in_force: timeInForce,
+    });
+  }
+
+  async getQuote(symbol) {
+    // Use polygon or alpaca data for quotes
+    return this.request("GET", `/v2/stocks/${symbol}/quotes/latest`);
+  }
+
+  async executeBuy(symbol, confidence, reasonText = "") {
+    if (!this.isConfigured()) {
+      this.logger.log(this.name, "not_configured", { symbol });
+      return null;
+    }
+
+    // Cooldown check (5 min)
+    const lastTrade = this.lastTrades.get(symbol);
+    if (lastTrade && Date.now() - lastTrade < 300_000) {
+      this.logger.log(this.name, "skipped_cooldown", { symbol });
+      return null;
+    }
+
+    const account = await this.getAccount();
+    if (!account.ok) {
+      this.logger.log(this.name, "no_account", { symbol });
+      return null;
+    }
+
+    // Calculate position size
+    const sizePct = this.config.position_size_pct_of_cash;
+    const positionSize = Math.min(
+      account.data.cash * (sizePct / 100) * confidence,
+      this.config.max_position_value
+    );
+
+    if (positionSize < 100) {
+      this.logger.log(this.name, "skipped_size", { symbol, size: positionSize });
+      return null;
+    }
+
+    // Calculate qty based on current price
+    const quote = await this.getQuote(symbol);
+    let currentPrice = 100; // default
+    if (quote.ok) {
+      currentPrice = quote.data.bid_price || quote.data.ask_price || 100;
+    }
+
+    const qty = Math.floor(positionSize / currentPrice);
+    if (qty < 1) {
+      this.logger.log(this.name, "skipped_qty", { symbol, price: currentPrice, size: positionSize });
+      return null;
+    }
+
+    this.logger.log(this.name, "buy_order", { symbol, qty, price: currentPrice, reason: reasonText });
+
+    const order = await this.createOrder(symbol, qty, "buy");
+
+    if (order.ok) {
+      this.lastTrades.set(symbol, Date.now());
+      this.logger.log(this.name, "buy_executed", { symbol, qty, order_id: order.data.id });
+      if (this.alertSystem) {
+        this.alertSystem.sendAlert("trade_executed", `BUY ${qty} ${symbol} @ $${currentPrice.toFixed(2)}`, {
+          symbol,
+          side: "buy",
+          qty,
+          price: currentPrice,
+        });
+      }
+      return order.data;
+    } else {
+      this.logger.log(this.name, "buy_failed", { symbol, error: order.error });
+      return null;
+    }
+  }
+
+  async executeSell(symbol, reason) {
+    if (!this.isConfigured()) {
+      return null;
+    }
+
+    this.logger.log(this.name, "sell_order", { symbol, reason });
+
+    const order = await this.closePosition(symbol);
+
+    if (order.ok) {
+      this.logger.log(this.name, "sell_executed", { symbol, order_id: order.data.id, reason });
+      if (this.alertSystem) {
+        this.alertSystem.sendAlert("trade_executed", `SELL ${symbol} - ${reason}`, {
+          symbol,
+          side: "sell",
+          reason,
+        });
+      }
+      return order.data;
+    } else {
+      this.logger.log(this.name, "sell_failed", { symbol, error: order.error });
+      return null;
+    }
+  }
+}
+
+// ============================================================================
+// Trading Executor (MCP-based - kept for reference)
 // ============================================================================
 
 class TradingExecutor {
@@ -1337,6 +1514,7 @@ class SimpleOrchestrator {
     this.llmAnalyzer = new LLMAnalyzer(this.logger);
     this.executor = null;
     this.mcp = null;
+    this.useDirectAlpaca = false;
   }
 
   async connect() {
@@ -1352,8 +1530,19 @@ class SimpleOrchestrator {
       this.logger.log("System", "connected", { url });
       return true;
     } catch (err) {
-      console.error("Connection error:", err);
+      console.warn("MCP connection failed, trying direct Alpaca API...");
       this.mcp = null;
+
+      // Try direct Alpaca API
+      this.executor = new AlpacaDirectExecutor(this.logger, this.config, this.alerts);
+
+      if (this.executor.isConfigured()) {
+        this.useDirectAlpaca = true;
+        this.logger.log("System", "direct_alpaca", { message: "Using direct Alpaca API" });
+        console.warn("Using direct Alpaca API (paper trading)");
+        return true;
+      }
+
       this.executor = null;
       this.logger.log("System", "connection_failed", { error: err.message });
       return false;
@@ -1361,8 +1550,8 @@ class SimpleOrchestrator {
   }
 
   async getAccountState() {
-    // Return mock data if not connected to MCP
-    if (!this.mcp) {
+    // Return mock data if not connected to anything
+    if (!this.executor) {
       return {
         account: {
           equity: this.config.starting_equity || 100000,
@@ -1374,6 +1563,37 @@ class SimpleOrchestrator {
       };
     }
 
+    // Use direct Alpaca API if connected
+    if (this.useDirectAlpaca && this.executor instanceof AlpacaDirectExecutor) {
+      try {
+        const [account, positions] = await Promise.all([
+          this.executor.getAccount(),
+          this.executor.getPositions(),
+        ]);
+
+        // Determine if market is open (simplified - assume open Mon-Fri 9:30-16:00 ET)
+        const now = new Date();
+        const day = now.getDay();
+        const hour = now.getHours();
+        const isWeekday = day >= 1 && day <= 5;
+        const isMarketHours = hour >= 14 && hour < 21; // UTC equivalent of 9AM-4PM ET
+
+        return {
+          account: account.ok ? account.data : null,
+          positions: positions.ok ? positions.data : [],
+          clock: { is_open: isWeekday && isMarketHours, next_open: new Date().toISOString(), next_close: new Date().toISOString() },
+        };
+      } catch (err) {
+        this.logger.log("System", "alpaca_error", { error: err.message });
+        return {
+          account: null,
+          positions: [],
+          clock: { is_open: false },
+        };
+      }
+    }
+
+    // Use MCP if connected
     const [account, positions, clock] = await Promise.all([
       this.executor.callTool("accounts-get"),
       this.executor.callTool("positions-list"),
@@ -1546,9 +1766,19 @@ class SimpleOrchestrator {
         this.positionTracking.set(pos.symbol, tracking);
       }
 
-      // Get current quote for trailing stop
-      const quoteResult = await this.executor.callTool("market-quote", { symbol: pos.symbol });
-      const currentPrice = quoteResult.ok ? quoteResult.data.price : pos.current_price;
+      // Get current quote for trailing stop (skip if using direct Alpaca - use position data instead)
+      let currentPrice = pos.current_price;
+      if (!this.useDirectAlpaca) {
+        try {
+          const quoteResult = await this.executor.callTool("market-quote", { symbol: pos.symbol });
+          if (quoteResult.ok) {
+            currentPrice = quoteResult.data.price;
+          }
+        } catch (err) {
+          // Use position data
+        }
+      }
+
       tracking.peakPrice = Math.max(tracking.peakPrice, currentPrice);
 
       const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
@@ -1607,19 +1837,22 @@ class SimpleOrchestrator {
     for (const signal of buyCandidates.slice(0, 3)) {
       if (positions.length >= this.config.max_positions) break;
 
-      // Get technical indicators for LLM analysis
+      // Get technical indicators for LLM analysis (skip if using direct Alpaca)
       let technicals = null;
       let fundamentals = null;
-      try {
-        const techResult = await this.executor.callTool("technicals-get", {
-          symbol: signal.symbol,
-          timeframe: "1Day",
-        });
-        if (techResult.ok) {
-          technicals = techResult.data;
+
+      if (!this.useDirectAlpaca) {
+        try {
+          const techResult = await this.executor.callTool("technicals-get", {
+            symbol: signal.symbol,
+            timeframe: "1Day",
+          });
+          if (techResult.ok) {
+            technicals = techResult.data;
+          }
+        } catch (err) {
+          this.logger.log("System", "technicals_fetch_failed", { symbol: signal.symbol, error: err.message });
         }
-      } catch (err) {
-        this.logger.log("System", "technicals_fetch_failed", { symbol: signal.symbol, error: err.message });
       }
 
       // Get fundamentals data
