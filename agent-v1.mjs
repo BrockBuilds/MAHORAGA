@@ -306,6 +306,126 @@ class StockTwitsAgent {
 }
 
 // ============================================================================
+// Reddit Agent (Multi-Source Sentiment)
+// ============================================================================
+
+class RedditAgent {
+  constructor(logger) {
+    this.logger = logger;
+    this.name = "Reddit";
+    this.subreddits = ["wallstreetbets", "stocks", "investing", "options"];
+  }
+
+  // Basic keyword matching for sentiment (no API key needed)
+  async fetchSubredditPosts(subreddit, keywords, limit = 25) {
+    try {
+      // Use Reddit's public JSON API
+      const url = `https://www.reddit.com/r/${subreddit}/search.json?q=${encodeURIComponent(keywords.join(" OR "))}&restrict_sr=true&limit=${limit}&sort=hot`;
+      const res = await fetch(url, {
+        headers: { "User-Agent": "MahoragaTradingAgent/1.0" },
+      });
+
+      if (!res.ok) return [];
+      const data = await res.json();
+      return data.data?.children || [];
+    } catch (err) {
+      this.logger.log(this.name, "error", { subreddit, message: err.message });
+      return [];
+    }
+  }
+
+  async searchSymbol(symbol) {
+    // Search for symbol mentions across subreddits
+    const results = [];
+
+    for (const sub of this.subreddits) {
+      const posts = await this.fetchSubredditPosts(sub, [symbol, `$${symbol}`], 20);
+      results.push(...posts.map(p => ({
+        subreddit: sub,
+        title: p.data?.title || "",
+        selftext: p.data?.selftext || "",
+        score: p.data?.score || 0,
+        num_comments: p.data?.num_comments || 0,
+        created_utc: p.data?.created_utc,
+      })));
+      await sleep(200); // Rate limit
+    }
+
+    return results;
+  }
+
+  analyzeSentimentFromPosts(posts) {
+    const bullishTerms = ["bullish", "long", "buy", "call", "moon", "rip", "up", "gain", "profit", "breakout"];
+    const bearishTerms = ["bearish", "short", "put", "dump", "crash", "dead", "down", "loss", "sell", "breakdown"];
+
+    let bullish = 0, bearish = 0;
+    let totalScore = 0;
+
+    for (const post of posts) {
+      const text = `${post.title} ${post.selftext}`.toLowerCase();
+      const score = Math.log10(Math.max(1, post.score + 1)); // Log scale for score weight
+
+      let postBullish = 0, postBearish = 0;
+      for (const term of bullishTerms) if (text.includes(term)) postBullish++;
+      for (const term of bearishTerms) if (text.includes(term)) postBearish++;
+
+      if (postBullish > postBearish) bullish += score;
+      else if (postBearish > postBullish) bearish += score;
+
+      totalScore += score;
+    }
+
+    const total = totalScore || 1;
+    return {
+      bullish,
+      bearish,
+      total_posts: posts.length,
+      score: (bullish - bearish) / Math.sqrt(total), // Normalized sentiment score
+    };
+  }
+
+  async gatherSignals() {
+    // Get trending tickers from StockTwits first, then search Reddit
+    // This avoids searching for every stock blindly
+    const signals = [];
+    const testedSymbols = new Set();
+
+    // Fetch a small sample of trending stocks to test on Reddit
+    const stocktwits = new StockTwitsAgent(this.logger);
+    const trending = await stocktwits.getTrending();
+
+    for (const sym of trending.slice(0, 10)) {
+      const symbol = sym.symbol;
+      if (testedSymbols.has(symbol)) continue;
+      testedSymbols.add(symbol);
+
+      const posts = await this.searchSymbol(symbol);
+      if (posts.length < 3) continue; // Need some discussion
+
+      const sentiment = this.analyzeSentimentFromPosts(posts);
+
+      if (posts.length >= 3) {
+        signals.push({
+          symbol: symbol,
+          source: "reddit",
+          sentiment: sentiment.score,
+          volume: posts.length,
+          bullish: Math.round(sentiment.bullish),
+          bearish: Math.round(sentiment.bearish),
+          reason: `Reddit: ${posts.length} posts, ${sentiment.bullish.toFixed(1)}B/${sentiment.bearish.toFixed(1)}b`,
+          subreddits: [...new Set(posts.map(p => p.subreddit))].join(","),
+        });
+      }
+
+      await sleep(300);
+    }
+
+    this.logger.log(this.name, "gathered_signals", { count: signals.length });
+    return signals;
+  }
+}
+
+// ============================================================================
 // LLM Analysis
 // ============================================================================
 
@@ -574,6 +694,7 @@ class SimpleOrchestrator {
     this.positionTracking = new Map(); // symbol -> { entryPrice, peakPrice, avgPrice, lastQuote }
 
     this.stocktwits = new StockTwitsAgent(this.logger);
+    this.reddit = new RedditAgent(this.logger);
     this.llmAnalyzer = new LLMAnalyzer(this.logger);
     this.executor = null;
     this.mcp = null;
@@ -611,10 +732,37 @@ class SimpleOrchestrator {
   }
 
   async runDataGatherers() {
-    this.logger.log("System", "gathering_data");
+    this.logger.log("System", "gathering_data from all sources");
 
-    const stocktwitsSignals = await this.stocktwits.gatherSignals();
-    this.signalCache = stocktwitsSignals;
+    // Gather in parallel
+    const [stocktwitsSignals, redditSignals] = await Promise.all([
+      this.stocktwits.gatherSignals(),
+      this.reddit.gatherSignals(),
+    ]);
+
+    // Merge signals by symbol, averaging sentiment
+    const mergedSignals = new Map();
+
+    // Add StockTwits signals
+    for (const sig of stocktwitsSignals) {
+      mergedSignals.set(sig.symbol, { ...sig, sources: ["stocktwits"] });
+    }
+
+    // Add Reddit signals, merging with existing
+    for (const sig of redditSignals) {
+      if (mergedSignals.has(sig.symbol)) {
+        const existing = mergedSignals.get(sig.symbol);
+        // Average the sentiment scores
+        const combinedSentiment = (existing.sentiment + sig.sentiment) / 2;
+        existing.sentiment = combinedSentiment;
+        existing.sources.push("reddit");
+        existing.reason += ` | Reddit: ${sig.bullish}B/${sig.bearish}b`;
+      } else {
+        mergedSignals.set(sig.symbol, { ...sig, sources: ["reddit"] });
+      }
+    }
+
+    this.signalCache = Array.from(mergedSignals.values());
 
     // Cleanup stale position tracking (positions no longer held)
     const { positions } = await this.getAccountState();
@@ -627,10 +775,11 @@ class SimpleOrchestrator {
 
     this.logger.log("System", "data_gathered", {
       stocktwits: stocktwitsSignals.length,
-      total: stocktwitsSignals.length,
+      reddit: redditSignals.length,
+      total: this.signalCache.length,
     });
 
-    return stocktwitsSignals;
+    return this.signalCache;
   }
 
   // ==========================================================================
