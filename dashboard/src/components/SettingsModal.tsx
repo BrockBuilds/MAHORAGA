@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import type { Config } from '../types'
 import { Panel } from './Panel'
 
@@ -11,9 +11,14 @@ interface SettingsModalProps {
 export function SettingsModal({ config, onSave, onClose }: SettingsModalProps) {
   const [localConfig, setLocalConfig] = useState<Config>(config)
   const [saving, setSaving] = useState(false)
+  const initialized = useRef(false)
 
   useEffect(() => {
-    setLocalConfig(config)
+    // Only sync on first mount, not on every parent update
+    if (!initialized.current) {
+      setLocalConfig(config)
+      initialized.current = true
+    }
   }, [config])
 
   const handleChange = (key: keyof Config, value: string | number) => {
