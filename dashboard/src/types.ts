@@ -190,6 +190,7 @@ export interface Status {
   config: Config
   signals: Signal[]
   logs: LogEntry[]
+  tradeHistory?: LogEntry[]
   costs: CostTracker
   lastAnalystRun: number
   lastResearchRun: number

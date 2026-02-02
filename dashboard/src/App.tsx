@@ -213,16 +213,10 @@ export default function App() {
     )
   }, [portfolioHistory])
 
-  // Extract trade history from logs
+  // Use persistent trade history from API (stored in trade-history.json)
   const tradeHistory = useMemo(() => {
-    const trades: LogEntry[] = []
-    logs.forEach(log => {
-      if ((log.action === 'buy_executed' || log.action === 'sell_executed' || log.action === 'emergency_sell') && log.symbol) {
-        trades.push(log)
-      }
-    })
-    return trades.slice(-20).reverse() // Show last 20 trades, newest first
-  }, [logs])
+    return (status?.tradeHistory || []).slice(-20).reverse()
+  }, [status?.tradeHistory])
 
   // Normalize position price histories to % change for stacked comparison view
   const normalizedPositionSeries = useMemo(() => {

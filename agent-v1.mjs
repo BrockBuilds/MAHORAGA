@@ -59,6 +59,7 @@ loadEnvFile();
 
 const CONFIG_PATH = path.join(process.cwd(), "agent-config.json");
 const LOG_PATH = path.join(process.cwd(), "agent-logs.json");
+const TRADES_PATH = path.join(process.cwd(), "trade-history.json");
 
 const DEFAULT_CONFIG = {
   mcp_url: process.env.MCP_URL || "http://localhost:8787/mcp",
@@ -115,6 +116,7 @@ class ActivityLogger {
   constructor(maxEntries = 500) {
     this.maxEntries = maxEntries;
     this.entries = [];
+    this.tradeHistory = [];
     this.costTracker = { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 };
     this.drawdownTracking = {
       daily: { startEquity: null, startDate: null, peakEquity: null },
@@ -132,6 +134,10 @@ class ActivityLogger {
         this.costTracker = data.costTracker || this.costTracker;
         this.drawdownTracking = data.drawdownTracking || this.drawdownTracking;
       }
+      if (fs.existsSync(TRADES_PATH)) {
+        const data = JSON.parse(fs.readFileSync(TRADES_PATH, "utf-8"));
+        this.tradeHistory = data.trades || [];
+      }
     } catch (e) {
       console.error("Failed to load logs:", e.message);
     }
@@ -144,6 +150,11 @@ class ActivityLogger {
       drawdownTracking: this.drawdownTracking,
     };
     fs.writeFileSync(LOG_PATH, JSON.stringify(data, null, 2));
+  }
+
+  saveTrades() {
+    const data = { trades: this.tradeHistory.slice(-1000) }; // Keep last 1000 trades
+    fs.writeFileSync(TRADES_PATH, JSON.stringify(data, null, 2));
   }
 
   log(agent, action, details = {}) {
@@ -164,6 +175,22 @@ class ActivityLogger {
 
   getRecentLogs(limit = 50) {
     return this.entries.slice(-limit);
+  }
+
+  getTradeHistory(limit = 50) {
+    return this.tradeHistory.slice(-limit);
+  }
+
+  logTrade(action, details) {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      action,
+      ...details,
+    };
+    this.tradeHistory.push(entry);
+    this.saveTrades();
+    console.log(`[TRADE] [${entry.timestamp}] ${action} ${details.symbol || ""}`);
+    return entry;
   }
 
   getCosts() {
@@ -1030,6 +1057,7 @@ class AlpacaDirectExecutor {
     if (order.ok) {
       this.lastTrades.set(symbol, Date.now());
       this.logger.log(this.name, "buy_executed", { symbol, qty, order_id: order.data.id });
+      this.logger.logTrade("buy_executed", { symbol, qty, price: currentPrice });
       if (this.alertSystem) {
         this.alertSystem.sendAlert("trade_executed", `BUY ${qty} ${symbol} @ $${currentPrice.toFixed(2)}`, {
           symbol,
@@ -1056,6 +1084,15 @@ class AlpacaDirectExecutor {
 
     if (order.ok) {
       this.logger.log(this.name, "sell_executed", { symbol, order_id: order.data.id, reason });
+      // Get position data for trade history
+      const positions = await this.getPositions();
+      const pos = positions.data?.find(p => p.symbol === symbol);
+      this.logger.logTrade("sell_executed", { 
+        symbol, 
+        qty: pos?.qty || 0, 
+        price: pos?.current_price || 0,
+        reason 
+      });
       if (this.alertSystem) {
         this.alertSystem.sendAlert("trade_executed", `SELL ${symbol} - ${reason}`, {
           symbol,
@@ -1146,6 +1183,7 @@ class TradingExecutor {
         size: positionSize.toFixed(2),
         reason: reasonText,
       });
+      this.logger.logTrade("buy_executed", { symbol, qty: Math.floor(positionSize / currentPrice), price: currentPrice });
       if (this.alertSystem) {
         this.alertSystem.sendAlert("trade_executed", `BUY ${symbol} - $${positionSize.toFixed(2)}`, {
           symbol,
@@ -2057,6 +2095,7 @@ class SimpleOrchestrator {
       config: { ...this.config, llm_model: llmModel },
       signals: this.signalCache,
       logs: this.logger.getRecentLogs(100),
+      tradeHistory: this.logger.getTradeHistory(100),
       costs: this.logger.getCosts(),
       lastAnalystRun: this.lastAnalystRun,
       killSwitch: this.killSwitch,
@@ -2297,6 +2336,11 @@ function startDashboardAPI(orchestrator) {
                 for (const pos of positions.data) {
                   await orchestrator.executor.closePosition(pos.symbol);
                   orchestrator.logger.log("System", "emergency_sell", { symbol: pos.symbol, qty: pos.qty });
+                  orchestrator.logger.logTrade("emergency_sell", { 
+                    symbol: pos.symbol, 
+                    qty: Number(pos.qty || 0), 
+                    price: Number(pos.current_price || 0) 
+                  });
                 }
               }
               orchestrator.killSwitch = true;
@@ -2324,6 +2368,11 @@ function startDashboardAPI(orchestrator) {
                 for (const pos of positions.data) {
                   await orchestrator.executor.closePosition(pos.symbol);
                   orchestrator.logger.log("System", "emergency_sell", { symbol: pos.symbol, qty: pos.qty });
+                  orchestrator.logger.logTrade("emergency_sell", { 
+                    symbol: pos.symbol, 
+                    qty: Number(pos.qty || 0), 
+                    price: Number(pos.current_price || 0) 
+                  });
                 }
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ ok: true, message: `Sold ${positions.data.length} positions` }));
