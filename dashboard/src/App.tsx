@@ -189,8 +189,8 @@ export default function App() {
   const isMarketOpen = status?.clock?.is_open ?? false
 
   const startingEquity = config?.starting_equity || 100000
-  const unrealizedPl = positions.reduce((sum, p) => sum + p.unrealized_pl, 0)
-  const totalPl = account ? account.equity - startingEquity : 0
+  const unrealizedPl = positions.reduce((sum, p) => sum + Number(p.unrealized_pl || 0), 0)
+  const totalPl = account ? Number(account.equity || 0) - startingEquity : 0
   const realizedPl = totalPl - unrealizedPl
   const totalPlPct = account ? (totalPl / startingEquity) * 100 : 0
 
@@ -216,6 +216,17 @@ export default function App() {
       new Date(s.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })
     )
   }, [portfolioHistory])
+
+  // Extract trade history from logs
+  const tradeHistory = useMemo(() => {
+    const trades: LogEntry[] = []
+    logs.forEach(log => {
+      if ((log.action === 'buy_executed' || log.action === 'sell_executed') && log.symbol) {
+        trades.push(log)
+      }
+    })
+    return trades.slice(-20).reverse() // Show last 20 trades, newest first
+  }, [logs])
 
   // Normalize position price histories to % change for stacked comparison view
   const normalizedPositionSeries = useMemo(() => {
@@ -594,6 +605,49 @@ export default function App() {
                   ))
                 )}
                 <div ref={logsEndRef} />
+              </div>
+            </Panel>
+          </div>
+
+          <div className="col-span-4 md:col-span-4 lg:col-span-4">
+            <Panel title="TRADE HISTORY" titleRight={tradeHistory.length.toString()} className="h-80">
+              <div className="overflow-y-auto h-full font-mono text-xs space-y-1">
+                {tradeHistory.length === 0 ? (
+                  <div className="text-hud-text-dim py-4 text-center">No trades yet...</div>
+                ) : (
+                  tradeHistory.map((log: LogEntry, i: number) => {
+                    const qty = typeof log.qty === 'number' ? log.qty : Number(log.qty)
+                    const price = typeof log.price === 'number' ? log.price : Number(log.price)
+                    return (
+                    <motion.div 
+                      key={`${log.timestamp}-${i}`}
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      className={clsx(
+                        "flex items-center justify-between py-1 px-2 border-b border-hud-line/10",
+                        log.action === 'buy_executed' ? 'bg-hud-success/5' : 'bg-hud-error/5'
+                      )}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className={clsx(
+                          'hud-value-sm font-bold',
+                          log.action === 'buy_executed' ? 'text-hud-success' : 'text-hud-error'
+                        )}>
+                          {log.action === 'buy_executed' ? 'BUY' : 'SELL'}
+                        </span>
+                        <span className="text-hud-primary">{log.symbol}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        {qty > 0 && <span className="text-hud-text-dim">x{qty}</span>}
+                        {price > 0 && <span className="text-hud-text">@{formatCurrency(price)}</span>}
+                        <span className="text-hud-text-dim text-[10px]">
+                          {new Date(log.timestamp).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })}
+                        </span>
+                      </div>
+                    </motion.div>
+                    )
+                  })
+                )}
               </div>
             </Panel>
           </div>
