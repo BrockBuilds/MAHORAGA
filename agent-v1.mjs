@@ -524,6 +524,69 @@ class TwitterAgent {
 }
 
 // ============================================================================
+// Options Flow Agent (Unusual Options Activity)
+// ============================================================================
+
+class OptionsFlowAgent {
+  constructor(logger) {
+    this.logger = logger;
+    this.name = "OptionsFlow";
+  }
+
+  // Detect unusual options activity from MCP data
+  async getOptionsData(symbol) {
+    try {
+      // This would use the MCP server's options data
+      // For now, we'll check if options data is available
+      return null; // Placeholder - actual implementation via MCP
+    } catch (err) {
+      return null;
+    }
+  }
+
+  async gatherSignals() {
+    // Options flow requires MCP connection with options provider
+    // This is a placeholder that returns empty signals
+    // Actual implementation would fetch options chains and analyze flow
+
+    this.logger.log(this.name, "options_flow_enabled", {
+      message: "Options flow signals require options provider configuration",
+    });
+
+    return [];
+  }
+
+  // Analyze unusual options activity
+  analyzeFlow(contracts) {
+    const calls = contracts.filter(c => c.type === "call");
+    const puts = contracts.filter(c => c.type === "put");
+
+    const callVolume = calls.reduce((sum, c) => sum + (c.volume || 0), 0);
+    const putVolume = puts.reduce((sum, p) => sum + (p.volume || 0), 0);
+
+    const callOI = calls.reduce((sum, c) => sum + (c.open_interest || 0), 0);
+    const putOI = puts.reduce((sum, p) => sum + (p.open_interest || 0), 0);
+
+    // Calculate put/call ratio
+    const pcRatio = callVolume > 0 ? putVolume / callVolume : 1;
+
+    // Detect unusual activity (high volume relative to OI)
+    const unusualCalls = calls.filter(c => c.volume > c.open_interest * 2);
+    const unusualPuts = puts.filter(p => p.volume > p.open_interest * 2);
+
+    return {
+      call_volume: callVolume,
+      put_volume: putVolume,
+      pc_ratio: pcRatio,
+      call_oi: callOI,
+      put_oi: putOI,
+      unusual_activity: unusualCalls.length + unusualPuts.length,
+      sentiment: callVolume > putVolume * 1.5 ? "bullish" : putVolume > callVolume * 1.5 ? "bearish" : "neutral",
+    };
+  }
+}
+
+// ============================================================================
 // LLM Analysis
 // ============================================================================
 
@@ -794,6 +857,7 @@ class SimpleOrchestrator {
     this.stocktwits = new StockTwitsAgent(this.logger);
     this.reddit = new RedditAgent(this.logger);
     this.twitter = new TwitterAgent(this.logger);
+    this.optionsFlow = new OptionsFlowAgent(this.logger);
     this.llmAnalyzer = new LLMAnalyzer(this.logger);
     this.executor = null;
     this.mcp = null;
@@ -834,10 +898,11 @@ class SimpleOrchestrator {
     this.logger.log("System", "gathering_data from all sources");
 
     // Gather in parallel
-    const [stocktwitsSignals, redditSignals, twitterSignals] = await Promise.all([
+    const [stocktwitsSignals, redditSignals, twitterSignals, optionsSignals] = await Promise.all([
       this.stocktwits.gatherSignals(),
       this.reddit.gatherSignals(),
       this.twitter.gatherSignals(),
+      this.optionsFlow.gatherSignals(),
     ]);
 
     // Merge signals by symbol, averaging sentiment
@@ -873,6 +938,20 @@ class SimpleOrchestrator {
         existing.reason += ` | Twitter: ${sig.bullish}B/${sig.bearish}b`;
       } else {
         mergedSignals.set(sig.symbol, { ...sig, sources: ["twitter"] });
+      }
+    }
+
+    // Add Options Flow signals, merging with existing
+    for (const sig of optionsSignals) {
+      if (mergedSignals.has(sig.symbol)) {
+        const existing = mergedSignals.get(sig.symbol);
+        // Average the sentiment scores
+        const combinedSentiment = (existing.sentiment + sig.sentiment) / 2;
+        existing.sentiment = combinedSentiment;
+        existing.sources.push("options_flow");
+        existing.reason += ` | Options: ${sig.reason}`;
+      } else {
+        mergedSignals.set(sig.symbol, { ...sig, sources: ["options_flow"] });
       }
     }
 
