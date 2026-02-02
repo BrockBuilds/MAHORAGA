@@ -587,6 +587,105 @@ class OptionsFlowAgent {
 }
 
 // ============================================================================
+// Fundamentals Agent (P/E, Revenue, Earnings Data)
+// ============================================================================
+
+class FundamentalsAgent {
+  constructor(logger) {
+    this.logger = logger;
+    this.name = "Fundamentals";
+    // Placeholder for fundamental data API (FMP, Alpha Vantage, etc.)
+    this.apiKey = process.env.FUNDAMENTALS_API_KEY;
+  }
+
+  isConfigured() {
+    return !!this.apiKey;
+  }
+
+  async fetchMetrics(symbol) {
+    // Placeholder for fundamental data API
+    // In production: use Financial Modeling Prep, Alpha Vantage, or similar
+    return {
+      symbol,
+      pe_ratio: null,
+      market_cap: null,
+      revenue_growth: null,
+      profit_margin: null,
+      debt_to_equity: null,
+      eps: null,
+    };
+  }
+
+  analyzeFundamentals(metrics) {
+    // Score fundamentals (0-1, higher is better)
+    let score = 0.5; // Neutral baseline
+    const factors = [];
+
+    // P/E ratio scoring (lower is generally better, but varies by sector)
+    if (metrics.pe_ratio !== null) {
+      if (metrics.pe_ratio < 15) {
+        score += 0.1;
+        factors.push("attractive P/E");
+      } else if (metrics.pe_ratio > 40) {
+        score -= 0.1;
+        factors.push("expensive P/E");
+      }
+    }
+
+    // Revenue growth
+    if (metrics.revenue_growth !== null) {
+      if (metrics.revenue_growth > 0.2) {
+        score += 0.15;
+        factors.push("strong revenue growth");
+      } else if (metrics.revenue_growth < 0) {
+        score -= 0.1;
+        factors.push("declining revenue");
+      }
+    }
+
+    // Profit margin
+    if (metrics.profit_margin !== null) {
+      if (metrics.profit_margin > 0.15) {
+        score += 0.1;
+        factors.push("strong margins");
+      } else if (metrics.profit_margin < 0) {
+        score -= 0.15;
+        factors.push("unprofitable");
+      }
+    }
+
+    // Debt levels
+    if (metrics.debt_to_equity !== null) {
+      if (metrics.debt_to_equity > 2) {
+        score -= 0.1;
+        factors.push("high debt");
+      } else if (metrics.debt_to_equity < 0.5) {
+        score += 0.05;
+        factors.push("low debt");
+      }
+    }
+
+    return {
+      score: Math.max(0, Math.min(1, score)), // Clamp 0-1
+      factors,
+    };
+  }
+
+  async gatherSignals() {
+    // This agent doesn't generate signals directly
+    // It provides fundamental data that modifies sentiment-based signals
+    // Used by LLMAnalyzer to incorporate fundamentals
+
+    this.logger.log(this.name, "fundamentals_enabled", {
+      configured: this.isConfigured(),
+      message: "Fundamentals data available for LLM analysis",
+    });
+
+    return [];
+  }
+}
+
+// ============================================================================
 // LLM Analysis
 // ============================================================================
 
@@ -604,7 +703,7 @@ class LLMAnalyzer {
     return !!this.apiKey;
   }
 
-  async analyzeSignal(signal, technicals = null) {
+  async analyzeSignal(signal, technicals = null, fundamentals = null) {
     const cacheKey = signal.symbol;
     const cached = this.cache.get(cacheKey);
 
@@ -631,6 +730,20 @@ TECHNICAL INDICATORS:
 `;
     }
 
+    // Build fundamentals context
+    let fundamentalsContext = "";
+    if (fundamentals) {
+      fundamentalsContext = `
+FUNDAMENTALS:
+- P/E Ratio: ${fundamentals.pe_ratio?.toFixed(2) || "N/A"}
+- Revenue Growth: ${fundamentals.revenue_growth ? (fundamentals.revenue_growth * 100).toFixed(1) + "%" : "N/A"}
+- Profit Margin: ${fundamentals.profit_margin ? (fundamentals.profit_margin * 100).toFixed(1) + "%" : "N/A"}
+- Debt/Equity: ${fundamentals.debt_to_equity?.toFixed(2) || "N/A"}
+- EPS: ${fundamentals.eps?.toFixed(2) || "N/A"}
+- Score Factors: ${fundamentals.factors?.join(", ") || "N/A"}
+`;
+    }
+
     const prompt = `Analyze this trading signal and provide a recommendation.
 
 IMPORTANT: You must identify counterarguments before making a decision. Trading against the crowd can be profitable, but you need to understand what the bears are thinking.
@@ -638,12 +751,14 @@ IMPORTANT: You must identify counterarguments before making a decision. Trading 
 SENTIMENT DATA:
 - Symbol: ${signal.symbol}
 - Source: ${signal.source}
+- Sources contributing: ${signal.sources?.join(", ") || signal.source}
 - Bullish messages: ${signal.bullish}
 - Bearish messages: ${signal.bearish}
 - Sentiment score: ${(signal.sentiment * 100).toFixed(0)}% (range: -100% to +100%)
 - Message volume: ${signal.volume}
 - Sentiment reason: ${signal.reason}
 ${technicalContext}
+${fundamentalsContext}
 
 YOUR TASK:
 1. First, identify 2-3 BEARISH arguments for this symbol (even if sentiment is bullish)
@@ -858,6 +973,7 @@ class SimpleOrchestrator {
     this.reddit = new RedditAgent(this.logger);
     this.twitter = new TwitterAgent(this.logger);
     this.optionsFlow = new OptionsFlowAgent(this.logger);
+    this.fundamentals = new FundamentalsAgent(this.logger);
     this.llmAnalyzer = new LLMAnalyzer(this.logger);
     this.executor = null;
     this.mcp = null;
@@ -1117,6 +1233,7 @@ class SimpleOrchestrator {
 
       // Get technical indicators for LLM analysis
       let technicals = null;
+      let fundamentals = null;
       try {
         const techResult = await this.executor.callTool("technicals-get", {
           symbol: signal.symbol,
@@ -1129,13 +1246,23 @@ class SimpleOrchestrator {
         this.logger.log("System", "technicals_fetch_failed", { symbol: signal.symbol, error: err.message });
       }
 
+      // Get fundamentals data
+      if (this.fundamentals.isConfigured()) {
+        try {
+          const metrics = await this.fundamentals.fetchMetrics(signal.symbol);
+          fundamentals = this.fundamentals.analyzeFundamentals(metrics);
+        } catch (err) {
+          this.logger.log("System", "fundamentals_fetch_failed", { symbol: signal.symbol, error: err.message });
+        }
+      }
+
       // Use LLM analysis if available, otherwise fall back to sentiment
       let llmDecision = null;
       let confidence = Math.min(1, Math.max(0.5, signal.sentiment + 0.3));
       let useLlm = false;
 
       if (this.llmAnalyzer.isConfigured()) {
-        llmDecision = await this.llmAnalyzer.analyzeSignal(signal, technicals);
+        llmDecision = await this.llmAnalyzer.analyzeSignal(signal, technicals, fundamentals);
 
         if (llmDecision) {
           useLlm = true;
