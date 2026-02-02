@@ -690,18 +690,23 @@ class FundamentalsAgent {
 // ============================================================================
 
 class LLMAnalyzer {
-  constructor(logger, apiKey = null) {
+  constructor(logger, config = {}) {
     this.logger = logger;
-    this.apiKey = apiKey || process.env.MINIMAX_API_KEY;
+    this.config = config;
     this.name = "LLMAnalyzer";
-    this.model = "minimax/MiniMax-M2.1";
-    this.apiUrl = "https://api.minimax.io/anthropic/v1/messages";
     this.cache = new Map(); // symbol -> { result, timestamp }
     this.cacheDuration = 300_000; // 5 minutes
   }
 
   isConfigured() {
-    return !!this.apiKey;
+    // Check MiniMax first, then OpenRouter
+    return !!(process.env.MINIMAX_API_KEY) || !!(process.env.OPENROUTER_API_KEY);
+  }
+
+  getProvider() {
+    if (process.env.MINIMAX_API_KEY) return "minimax";
+    if (process.env.OPENROUTER_API_KEY) return "openrouter";
+    return null;
   }
 
   async analyzeSignal(signal, technicals = null, fundamentals = null) {
@@ -718,116 +723,25 @@ class LLMAnalyzer {
       return null;
     }
 
-    // Build technical context
-    let technicalContext = "";
-    if (technicals) {
-      technicalContext = `
-TECHNICAL INDICATORS:
-- RSI: ${technicals.rsi?.toFixed(2) || "N/A"} (${this.interpretRsi(technicals.rsi)})
-- MACD: ${technicals.macd?.toFixed(2) || "N/A"} (${this.interpretMacd(technicals.macd, technicals.macd_signal)})
-- ATR %: ${technicals.atr_pct?.toFixed(2) || "N/A"}% (volatility)
-- Price vs 50 SMA: ${this.priceVsSma(technicals.price, technicals.sma_50)}%
-- Volume: ${technicals.volume?.toFixed(0) || "N/A"}
-`;
-    }
+    // Build compact prompt
+    const prompt = `${signal.symbol}: ${(signal.sentiment * 100).toFixed(0)}% bullish (${signal.bullish} bullish, ${signal.bearish} bearish). ${signal.reason}
 
-    // Build fundamentals context
-    let fundamentalsContext = "";
-    if (fundamentals) {
-      fundamentalsContext = `
-FUNDAMENTALS:
-- P/E Ratio: ${fundamentals.pe_ratio?.toFixed(2) || "N/A"}
-- Revenue Growth: ${fundamentals.revenue_growth ? (fundamentals.revenue_growth * 100).toFixed(1) + "%" : "N/A"}
-- Profit Margin: ${fundamentals.profit_margin ? (fundamentals.profit_margin * 100).toFixed(1) + "%" : "N/A"}
-- Debt/Equity: ${fundamentals.debt_to_equity?.toFixed(2) || "N/A"}
-- EPS: ${fundamentals.eps?.toFixed(2) || "N/A"}
-- Score Factors: ${fundamentals.factors?.join(", ") || "N/A"}
-`;
-    }
-
-    const prompt = `Analyze this trading signal and provide a recommendation.
-
-IMPORTANT: You must identify counterarguments before making a decision. Trading against the crowd can be profitable, but you need to understand what the bears are thinking.
-
-SENTIMENT DATA:
-- Symbol: ${signal.symbol}
-- Source: ${signal.source}
-- Sources contributing: ${signal.sources?.join(", ") || signal.source}
-- Bullish messages: ${signal.bullish}
-- Bearish messages: ${signal.bearish}
-- Sentiment score: ${(signal.sentiment * 100).toFixed(0)}% (range: -100% to +100%)
-- Message volume: ${signal.volume}
-- Sentiment reason: ${signal.reason}
-${technicalContext}
-${fundamentalsContext}
-
-YOUR TASK:
-1. First, identify 2-3 BEARISH arguments for this symbol (even if sentiment is bullish)
-2. Identify 2-3 BULLISH arguments for this symbol (even if sentiment is bearish)
-3. Weigh the evidence and make a final decision
-
-Respond with a JSON object (no markdown, just the JSON):
-{
-  "bullish_arguments": ["arg1", "arg2", "arg3"],
-  "bearish_arguments": ["arg1", "arg2", "arg3"],
-  "decision": "BUY" | "SKIP" | "WAIT",
-  "confidence": 0.0 to 1.0,
-  "reasoning": "2-3 sentence summary weighing both sides",
-  "risks": "key risks to consider"
-}
-
-Guidelines:
-- If sentiment is strongly bullish (>70%), the bearish arguments should be especially compelling to override
-- If sentiment is mixed or slightly bullish, look for confirmation from technicals
-- SKIP if you cannot find enough information to make a confident decision
-- WAIT if the timing seems wrong but the thesis is sound`;
+Respond JSON only:
+{"decision":"BUY|SKIP|WAIT","confidence":0.0-1.0,"reasoning":"1-2 sentences"}`;
 
     try {
-      const response = await fetch(this.apiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${this.apiKey}`,
-          "anthropic-version": "2023-06-01",
-        },
-        body: JSON.stringify({
-          model: this.model,
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.3,
-          max_tokens: 200,
-        }),
-      });
+      const provider = this.getProvider();
+      let result;
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        this.logger.log(this.name, "api_error", { symbol: signal.symbol, status: response.status, error: errorText });
+      if (provider === "minimax") {
+        result = await this.callMiniMax(prompt, signal.symbol);
+      } else if (provider === "openrouter") {
+        result = await this.callOpenRouter(prompt, signal.symbol);
+      }
+
+      if (!result) {
         return null;
       }
-
-      const data = await response.json();
-
-      // MiniMax returns content as blocks (thinking, text, etc.)
-      // Extract text from the first text-type block, or use thinking as fallback
-      let content = "";
-      if (data.content && Array.isArray(data.content)) {
-        const textBlock = data.content.find(block => block.type === "text");
-        content = textBlock?.text || data.content[0]?.thinking || "";
-      } else if (data.content) {
-        content = data.content;
-      }
-
-      if (!content) {
-        return null;
-      }
-
-      // Parse JSON from response
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        this.logger.log(this.name, "parse_error", { symbol: signal.symbol, content });
-        return null;
-      }
-
-      const result = JSON.parse(jsonMatch[0]);
 
       // Cache the result
       this.cache.set(cacheKey, { result, timestamp: Date.now() });
@@ -836,14 +750,108 @@ Guidelines:
         symbol: signal.symbol,
         decision: result.decision,
         confidence: result.confidence,
-        bullish_args_count: result.bullish_arguments?.length || 0,
-        bearish_args_count: result.bearish_arguments?.length || 0,
         reasoning: result.reasoning,
+        provider,
       });
 
       return result;
     } catch (err) {
       this.logger.log(this.name, "error", { symbol: signal.symbol, error: err.message });
+      return null;
+    }
+  }
+
+  async callMiniMax(prompt, symbol) {
+    const apiKey = process.env.MINIMAX_API_KEY;
+    const url = "https://api.minimax.io/anthropic/v1/messages";
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "minimax/MiniMax-M2.1",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.3,
+        max_tokens: 150,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      this.logger.log(this.name, "api_error", { symbol, provider: "minimax", status: response.status, error: errorText });
+      return null;
+    }
+
+    const data = await response.json();
+
+    // Extract content from thinking blocks
+    let content = "";
+    if (data.content && Array.isArray(data.content)) {
+      content = data.content[0]?.thinking || "";
+    }
+
+    // Parse JSON from content
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      this.logger.log(this.name, "parse_error", { symbol, provider: "minimax", content: content.slice(0, 200) });
+      return null;
+    }
+
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      this.logger.log(this.name, "parse_error", { symbol, error: e.message });
+      return null;
+    }
+  }
+
+  async callOpenRouter(prompt, symbol) {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    const url = "https://openrouter.ai/api/v1/chat/completions";
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": "https://github.com/BrockBuilds/MAHORAGA",
+      },
+      body: JSON.stringify({
+        model: "anthropic/claude-3-haiku", // Default, can be overridden
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.3,
+        max_tokens: 150,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      this.logger.log(this.name, "api_error", { symbol, provider: "openrouter", status: response.status, error: errorText });
+      return null;
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+
+    if (!content) {
+      return null;
+    }
+
+    // Parse JSON from content
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      this.logger.log(this.name, "parse_error", { symbol, provider: "openrouter", content: content.slice(0, 200) });
+      return null;
+    }
+
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      this.logger.log(this.name, "parse_error", { symbol, error: e.message });
       return null;
     }
   }
@@ -2113,6 +2121,7 @@ function startDashboardAPI(orchestrator) {
       } else if (url.pathname === "/api/setup/status") {
         const hasAlpaca = !!(process.env.ALPACA_API_KEY && process.env.ALPACA_API_SECRET);
         const hasMiniMax = !!process.env.MINIMAX_API_KEY;
+        const hasOpenRouter = !!process.env.OPENROUTER_API_KEY;
         const startingEquity = orchestrator.config.starting_equity || 100000;
         
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -2121,7 +2130,10 @@ function startDashboardAPI(orchestrator) {
           data: { 
             configured: hasAlpaca,
             has_alpaca: hasAlpaca,
-            has_llm: hasMiniMax,
+            has_llm: hasMiniMax || hasOpenRouter,
+            has_minimax: hasMiniMax,
+            has_openrouter: hasOpenRouter,
+            llm_provider: hasMiniMax ? "minimax" : (hasOpenRouter ? "openrouter" : null),
             starting_equity: startingEquity,
             paper_mode: process.env.ALPACA_PAPER === "true"
           } 
@@ -2131,7 +2143,7 @@ function startDashboardAPI(orchestrator) {
         req.on("data", (chunk) => body += chunk);
         req.on("end", () => {
           try {
-            const { alpaca_key, alpaca_secret, minimax_key, paper_mode, starting_equity } = JSON.parse(body);
+            const { alpaca_key, alpaca_secret, minimax_key, openrouter_key, paper_mode, starting_equity } = JSON.parse(body);
             
             // Build .dev.vars content
             let envContent = "";
@@ -2139,6 +2151,7 @@ function startDashboardAPI(orchestrator) {
             if (alpaca_secret) envContent += `ALPACA_API_SECRET=${alpaca_secret}\n`;
             envContent += `ALPACA_PAPER=${paper_mode !== false ? "true" : "false"}\n`;
             if (minimax_key) envContent += `MINIMAX_API_KEY=${minimax_key}\n`;
+            if (openrouter_key) envContent += `OPENROUTER_API_KEY=${openrouter_key}\n`;
             envContent += `KILL_SWITCH_SECRET=mahoraga_kill_${Date.now()}\n`;
             
             // Write to .dev.vars
